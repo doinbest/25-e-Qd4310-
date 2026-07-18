@@ -1,0 +1,993 @@
+diff --git a/Core/Src/main.c b/Core/Src/main.c
+index 1b132c8..3117cf9 100644
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -123,13 +123,12 @@ int main(void)
+   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+   protocol_init(); // PID protocol parser init
+-  maixcam_Init(&huart3);
+ 
+   Motor_Init();
+   Encoder_Init();
+   ZigbeeGrey_Init();
+-  JY61p_HardwareZeroYaw();
+   PID_param_init();
++  Control_Reset();
+   HAL_TIM_Base_Start_IT(&htim5);
+   HAL_TIM_Base_Start_IT(&htim6);
+   HAL_TIM_Base_Start_IT(&htim7);
+@@ -142,8 +141,11 @@ int main(void)
+   /* USER CODE BEGIN WHILE */
+   while (1)
+   {
+-    sprintf((char *)g_oledstring, "TEST");
+-    OLED_ShowString(0, 0, g_oledstring, 12);
++    /* 主循环只处理非实时任务，10ms 电机控制由 TIM7 调度。 */
++    key_scan();
++    ZigbeeGrey_Task_WithTick();
++    Protocol_Datas_Proc();
++    PID_Debug_OLED_Show();
+ 
+     /* USER CODE END WHILE */
+ 
+@@ -209,12 +211,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+ 
+     HAL_UART_Receive_IT(&huart1, &UART1_RxByte, 1);
+   }
+-  if (huart->Instance == USART3) 
+-  {
+-    maixcam_RxCpltCallback(huart);
+-  }
+-
+-  if (huart->Instance == UART4) 
++  if (huart->Instance == UART4)
+   {
+     jy61p_ReceiveData(g_usart4_receivedata);               
+     HAL_UART_Receive_IT(&huart4, &g_usart4_receivedata, 1); 
+diff --git a/Hardware/KEY/bsp_key.c b/Hardware/KEY/bsp_key.c
+index a6cd6b6..ba27f26 100644
+--- a/Hardware/KEY/bsp_key.c
++++ b/Hardware/KEY/bsp_key.c
+@@ -1,16 +1,20 @@
+ #include "bsp_key.h"
++#include "headfile.h"
+ 
+ uint8_t B1_State, B1_Last_State = 1;
+ uint8_t B2_State, B2_Last_State = 1;
+ uint8_t B3_State, B3_Last_State = 1;
+ uint8_t B4_State = 1, B4_Last_State = 0;
+ uint8_t B5_State = 1, B5_Last_State = 0;
+-uint8_t B4_flag = 0;
+-uint8_t B5_flag = 0;
+ uint8_t Calib_Step = 0;
+ uint8_t ZigbeeGrey_White_OK = 0;
+ uint8_t ZigbeeGrey_Black_OK = 0;
+ 
++/**
++  * @brief  每 20ms 扫描一次按键并处理底盘调试操作。
++  * @note   B1 校准白底/黑线，B2/B3 复位，B4 清除校准，B5 启停。
++  * @retval 无。
++  */
+ void key_scan(void)
+ {
+     static uint32_t last_scan_time = 0;
+@@ -42,7 +46,7 @@ void key_scan(void)
+             Calib_Step = 1;
+ 
+             uart5_send_string("Field white values saved.\r\n");
+-            uart5_send_string("Place the sensor on the red line, then press B1 again.\r\n");
++            uart5_send_string("Place the sensor on the black line, then press B1 again.\r\n");
+         }
+         else
+         {
+@@ -55,24 +59,20 @@ void key_scan(void)
+             Calib_Step = 2;
+ 
+             No_MCU_Ganv_Sensor_Init(&ZigbeeGrey_Sensor, ZigbeeGrey_White, ZigbeeGrey_Black);
+-            uart5_send_string("White and red-line calibration finished.\r\n");
++            uart5_send_string("White and black-line calibration finished.\r\n");
+         }
+     }
+ 
+     if (B2_State == 0 && B2_Last_State == 1)
+     {
+-        Control_Task_Reset();
+-        // Drug_Reset();
+-        MaixCAM_Reset_To_TargetScan(1);
+-        uart5_send_string("B2 pressed: mission reset and target rescan.\r\n");
++        Control_Reset();
++        uart5_send_string("B2 pressed: chassis reset.\r\n");
+     }
+ 
+     if (B3_State == 0 && B3_Last_State == 1)
+     {
+-        Control_Task_Reset();
+-        // Drug_Reset();
+-        MaixCAM_Reset_To_TargetScan(1);
+-        uart5_send_string("B3 pressed: mission soft reset.\r\n");
++        Control_Reset();
++        uart5_send_string("B3 pressed: chassis soft reset.\r\n");
+     }
+ 
+     if (B4_State == 0 && B4_Last_State == 1)
+@@ -87,20 +87,20 @@ void key_scan(void)
+             ZigbeeGrey_Black[i] = 0;
+         }
+ 
+-        uart5_send_string("Calibration reset. Press B1 to recalibrate white/red line.\r\n");
++        uart5_send_string("Calibration reset. Press B1 to recalibrate white/black line.\r\n");
+     }
+ 
+     if (B5_State == 0 && B5_Last_State == 1)
+     {
+-        car_go = (car_go == 0) ? 1 : 0;
+-        if (car_go == 0)
++        if (car_go != 0U)
+         {
+-            PID_Debug_Stop();
+-            uart5_send_string("B5 pressed: PID debug stop\r\n");
++            Control_Stop();
++            uart5_send_string("B5 pressed: chassis stop.\r\n");
+         }
+         else
+         {
+-            uart5_send_string("B5 pressed: PID debug start\r\n");
++            Control_Start();
++            uart5_send_string("B5 pressed: chassis start.\r\n");
+         }
+     }
+ 
+diff --git a/Hardware/KEY/bsp_key.h b/Hardware/KEY/bsp_key.h
+index 5e05e13..da385d2 100644
+--- a/Hardware/KEY/bsp_key.h
++++ b/Hardware/KEY/bsp_key.h
+@@ -1,7 +1,7 @@
+ #ifndef __BSP_KEY_H
+ #define __BSP_KEY_H
+ 
+-#include "headfile.h"
++#include <stdint.h>
+ 
+ void key_scan(void);
+ 
+@@ -10,8 +10,6 @@ extern uint8_t B2_State, B2_Last_State;
+ extern uint8_t B3_State, B3_Last_State;
+ extern uint8_t B4_State, B4_Last_State;
+ extern uint8_t B5_State, B5_Last_State;
+-extern uint8_t B4_flag;
+-extern uint8_t B5_flag;
+ 
+ extern uint8_t Calib_Step;
+ extern uint8_t ZigbeeGrey_White_OK;
+diff --git a/Hardware/PID/bsp_pid.c b/Hardware/PID/bsp_pid.c
+index c985835..b39a7ae 100644
+--- a/Hardware/PID/bsp_pid.c
++++ b/Hardware/PID/bsp_pid.c
+@@ -1,91 +1,44 @@
+ #include "bsp_pid.h"
+ 
+-//定义全局变量
+-
+-_pid pid_speed, pid_speed2; // 速度环
+-_pid pid_location; // 位置环
+-_pid pid_turn;  // 转向环 Gary
+-_pid pid_angle; // 角度环  wit
+-_pid pid_graysensor; // 灰度传感器巡线PID
++_pid pid_speed;
++_pid pid_speed2;
++_pid pid_location;
++_pid pid_angle;
++_pid pid_graysensor;
+ 
+ /**
+-  * @brief  PID参数初始化
+-	*	@note 	无
+-  * @retval 无
++  * @brief  初始化单个 PID 实例及其参数。
++  * @param  pid PID 实例指针。
++  * @param  kp 比例系数。
++  * @param  ki 积分系数。
++  * @param  kd 微分系数。
++  * @retval 无。
+   */
+-void PID_param_init()
++static void PID_InitInstance(_pid *pid, float kp, float ki, float kd)
+ {
+-  	/* 速度相关初始化参数 */
+-    pid_speed.target_val=0.0;				
+-    pid_speed.actual_val=0.0;
+-    pid_speed.err=0.0;
+-    pid_speed.err_last=0.0;
+-    pid_speed.integral=0.0;
+-    pid_speed.output = 0.0;
+-
+-		pid_speed.Kp = 1.0;
+-		pid_speed.Ki = 0.3;
+-		pid_speed.Kd = 0.0;
+-		
+-  	/* 速度相关初始化参数 */
+-    pid_speed2.target_val=0.0;				
+-    pid_speed2.actual_val=0.0;
+-    pid_speed2.err=0.0;
+-    pid_speed2.err_last=0.0;
+-    pid_speed2.integral=0.0;
+-    pid_speed2.output = 0.0;
+-  
+-		pid_speed2.Kp = 1.0;
+-		pid_speed2.Ki = 0.3;
+-		pid_speed2.Kd = 0.0;
+-
+-    /* 位置相关初始化参数 */
+-    pid_location.target_val = 0.0;
+-    pid_location.actual_val = 0.0;
+-    pid_location.err = 0.0;
+-    pid_location.err_last = 0.0;
+-    pid_location.integral = 0.0;
+-    pid_location.output = 0.0;
+-
+-    pid_location.Kp = 1.0;
+-    pid_location.Ki = 0.0;
+-    pid_location.Kd = 0.0;
+-
+-    /* 转向相关初始化参数 */
+-    pid_turn.target_val=0.0;				
+-    pid_turn.actual_val=0.0;
+-    pid_turn.err=0.0;
+-    pid_turn.err_last=0.0;
+-    pid_turn.integral=0.0;
+-    pid_turn.output = 0.0;
+-
+-    pid_turn.Kp = 0.0;
+-    pid_turn.Ki = 0.0;
+-    pid_turn.Kd = 0.0;
+-
+-    /* 角度相关初始化参数 */
+-    pid_angle.target_val=0.0;
+-    pid_angle.actual_val=0.0;
+-    pid_angle.err=0.0;         
+-    pid_angle.err_last=0.0;
+-    pid_angle.integral=0.0;
+-    pid_angle.output = 0.0;
+-
+-    pid_angle.Kp = 1.1;
+-    pid_angle.Ki = 0.00;
+-    pid_angle.Kd = 0.1;
+-
+-    pid_graysensor.target_val = 0.0;
+-    pid_graysensor.actual_val = 0.0;   
+-    pid_graysensor.err = 0.0;
+-    pid_graysensor.err_last = 0.0;
+-    pid_graysensor.integral = 0.0;
+-    pid_graysensor.output = 0.0;
+-
+-    pid_graysensor.Kp = 5.0;
+-    pid_graysensor.Ki = 0.0;
+-    pid_graysensor.Kd = 15.0;
++  pid->target_val = 0.0f;
++  pid->actual_val = 0.0f;
++  pid->err = 0.0f;
++  pid->err_last = 0.0f;
++  pid->err_prev = 0.0f;
++  pid->Kp = kp;
++  pid->Ki = ki;
++  pid->Kd = kd;
++  pid->integral = 0.0f;
++  pid->output = 0.0f;
++}
+ 
++/**
++  * @brief  初始化底盘使用的全部 PID 实例。
++  * @retval 无。
++  */
++void PID_param_init(void)
++{
++  PID_InitInstance(&pid_speed, 1.0f, 0.3f, 0.0f);
++  PID_InitInstance(&pid_speed2, 1.0f, 0.3f, 0.0f);
++  PID_InitInstance(&pid_location, 1.0f, 0.0f, 0.0f);
++  PID_InitInstance(&pid_angle, 1.1f, 0.0f, 0.1f);
++  PID_InitInstance(&pid_graysensor, 5.0f, 0.0f, 15.0f);
+ }
+ 
+ float Limit_Float(float val, float min, float max)
+@@ -327,34 +280,23 @@ float angle_pid_realize(_pid *pid, float actual_yaw)
+ 
+ 
+ /**
+- * 函    数：angle_graysensor_realize
+- * 说    明：根据灰度位置误差计算左右轮差速修正量
+- * 参    数：Target 灰度角度目标值，通常为 0
+- * 返 回 值：无，结果写入全局变量 Output_Yaw
+- */
+-void angle_graysensor_realize(float Target)
++  * @brief  根据灰度位置偏差计算左右轮差速修正量。
++  * @param  pid 灰度循迹 PID 实例。
++  * @param  actual_val 当前灰度归一化位置，理论范围为 -7*1024~7*1024。
++  * @retval 差速修正量，范围限制为 -50~50。
++  */
++float gray_pid_realize(_pid *pid, float actual_val)
+ {
+-  pid_graysensor.actual_val = result_angle;
+-  pid_graysensor.err = Target - pid_graysensor.actual_val;
+-  // Err_Yaw = Target - Yaw_Now_Correct;
+-  // Integral_Yaw += Err_Yaw;
+-  pid_graysensor.integral += pid_graysensor.err;
+-  if(pid_graysensor.integral > 5)
+-    pid_graysensor.integral = 5;
+-  if(pid_graysensor.integral < -5)  
+-    pid_graysensor.integral = -5;
+-  pid_graysensor.output = (((pid_graysensor.Kp * pid_graysensor.err) / 1024) +
+-                  ((pid_graysensor.Kd * (pid_graysensor.err - pid_graysensor.err_last)) / 1024) +
+-                  ((pid_graysensor.Ki * pid_graysensor.integral) / 1024));
+-  pid_graysensor.err_last = pid_graysensor.err;
+-
+-
+-  pid_graysensor.err_last = pid_graysensor.err;
+-  
+-  // LastErr_Yaw = Err_Yaw;
+-  
+-  // if (Output_Yaw > max)
+-  //   Output_Yaw = max;
+-  // if (Output_Yaw < -max)
+-  //   Output_Yaw = -max;
+-}
+\ No newline at end of file
++  pid->actual_val = actual_val;
++  pid->err = pid->target_val - pid->actual_val;
++  pid->integral += pid->err;
++  pid->integral = Limit_Float(pid->integral, -5.0f, 5.0f);
++
++  pid->output = (pid->Kp * pid->err +
++                 pid->Ki * pid->integral +
++                 pid->Kd * (pid->err - pid->err_last)) / 1024.0f;
++  pid->output = Limit_Float(pid->output, -50.0f, 50.0f);
++  pid->err_last = pid->err;
++
++  return pid->output;
++}
+diff --git a/Hardware/PID/bsp_pid.h b/Hardware/PID/bsp_pid.h
+index 1b244f0..2e18c8b 100644
+--- a/Hardware/PID/bsp_pid.h
++++ b/Hardware/PID/bsp_pid.h
+@@ -1,11 +1,5 @@
+ #ifndef __BSP_PID_H
+ #define	__BSP_PID_H
+-#include "stm32f1xx.h"
+-#include "usart.h"
+-#include "bsp_debug.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <math.h>
+ 
+ typedef struct
+ {
+@@ -28,8 +22,8 @@ typedef struct
+ extern _pid pid_speed, pid_speed2;
+ extern _pid pid_location;
+ extern _pid pid_angle;
+-extern _pid pid_turn;
+-extern _pid pid_maixcam;
++extern _pid pid_graysensor;
++
+ void PID_param_init(void);
+ float Limit_Float(float val, float min, float max);
+ void PID_Reset(_pid *pid);
+@@ -43,5 +37,6 @@ void set_p_i_d(_pid *pid, float p, float i, float d);
+ float location_pid_realize(_pid *pid, float actual_val);
+ float speed_pid_realize(_pid *pid, float actual_val);
+ float angle_pid_realize(_pid *pid, float actual_val);
++float gray_pid_realize(_pid *pid, float actual_val);
+ float Angle_Error(float target, float actual);
+ #endif
+diff --git a/Hardware/control.c b/Hardware/control.c
+index 0daf8fc..d96064b 100644
+--- a/Hardware/control.c
++++ b/Hardware/control.c
+@@ -1,184 +1,141 @@
+ #include "control.h"
++#include "headfile.h"
+ 
+-/* PID 调试参数 */
+-#define SPEED_TARGET_MAX 80.0f
+-#define DIST_DEBUG_STOP_WINDOW 10.0f
+-#define DIST_DEBUG_STABLE_CNT 3
+-#define DIST_DEBUG_MIN_SPEED 18.0f
+-#define DIST_DEBUG_LIMIT_K 0.12f
++/* 25E 底盘循迹验证参数。 */
++#define LINE_BASE_SPEED       30.0f
++#define SPEED_TARGET_LIMIT    80.0f
++#define LINE_TURN_LIMIT       50.0f
++#define PWM_OUTPUT_LIMIT      100.0f
+ 
+-/* 正式任务输出限幅 */
+-#define TURN_TARGET_MAX 80.0f
+-#define PWM_OUTPUT_MAX 100.0f
+-#define GYRO_ANGLE_DEADZONE 1.5f
+-#define GYRO_TURN_WEIGHT 0.25f
+-
+-/* 远端任务减速参数 */
+-#define FAR_T_SLOWDOWN_DISTANCE 180.0f
+-#define FAR_RUN1_SLOWDOWN_DISTANCE 320.0f
+-#define FAR_ROOM_BACK_SLOWDOWN_DISTANCE 80.0f
+-#define FAR_RETURN_T_SLOWDOWN_DISTANCE 280.0f
+-#define FAR_T_SLOW_SPEED_MAX 28.0f
+-#define FAR_RUN1_SLOW_SPEED_MAX 24.0f
+-#define FAR_SCAN_REMAIN_SPEED_MAX 55.0f
+-#define FAR_RUN1_SPEED_MAX 60.0f
+-#define FAR_T_GYRO_TURN_WEIGHT 0.60f
+-
+-/* 转向完成判定参数 */
+-#define TURN_ANGLE_TOLERANCE 2.0f
+-#define TURN_STABLE_CNT 20
+-#define TURN_SETTLE_TIME_MS 120U
+-#define FAR_SCAN_AFTER_TURN_STOP_MS 250U 
+-#define FAR_SCAN_AFTER_FOUND_STOP_MS 150U
+-#define FAR_SCAN_AFTER_RETURN_STOP_MS 250U
+-#define INTEGRAL_MAX 5
+-#define INTEGRAL_MIN -5
+-int SpeedL;
+-int SpeedR;
++int SpeedL = 0;
++int SpeedR = 0;
+ int Speed_Set = 0;
+-float Tarangle = 0;
+-int Kp_Yaw = 5;
+-int Ki_Yaw = 0;
+-int Kd_Yaw = 15;
+-int Yaw_Now_Correct;
+-int Integral_Yaw = 0;
+-int Err_Yaw = 0;
+-int LastErr_Yaw = 0;
+-int Output_Yaw = 0;
+ int result_angle = 0;
+-int max = 50;
++
+ uint8_t car_go = 0;
+ uint8_t Location_flag = 0;
+ uint8_t Angle_flag = 0;
+ uint8_t Gray_flag = 0;
+-uint8_t task_state = 0;
+-int8_t Run_Dir = 1;
+-static float distance_speed_target_max = SPEED_TARGET_MAX;
+-static uint8_t far_t_slowdown_active = 0;
+ 
+ /**
+-  * 函    数：Reset_GrayYaw_State
+-  * 说    明：清空灰度循迹角度环的中间状态，避免旧误差带入下一段控制
+-  * 返 回 值：无
++  * @brief  将左右轮目标速度转换为电机 PWM 输出。
++  * @param  left_target_speed 左轮目标速度，单位为每 10ms 编码器增量。
++  * @param  right_target_speed 右轮目标速度，单位为每 10ms 编码器增量。
++  * @retval 无。
+   */
+-static void Reset_GrayYaw_State(void)
++static void Cascade_Speed_Output(float left_target_speed, float right_target_speed)
+ {
+-    result_angle = 0;
+-    Output_Yaw = 0;
+-    Err_Yaw = 0;
+-    LastErr_Yaw = 0;
+-    Integral_Yaw = 0;
+-}
++    float left_pwm;
++    float right_pwm;
+ 
+-/**
+-  * 函    数：Reset_AnglePid_Output
+-  * 说    明：清空陀螺仪角度环 PID 的误差、积分和输出
+-  * 返 回 值：无
+-  */
+-static void Reset_AnglePid_Output(void)
+-{
+-    pid_angle.err = 0.0f;
+-    pid_angle.err_last = 0.0f;
+-    pid_angle.integral = 0.0f;
+-    pid_angle.output = 0.0f;
++    left_target_speed = Limit_Float(left_target_speed,
++                                    -SPEED_TARGET_LIMIT,
++                                    SPEED_TARGET_LIMIT);
++    right_target_speed = Limit_Float(right_target_speed,
++                                     -SPEED_TARGET_LIMIT,
++                                     SPEED_TARGET_LIMIT);
++
++    set_pid_target(&pid_speed, left_target_speed);
++    set_pid_target(&pid_speed2, right_target_speed);
++
++    left_pwm = speed_pid_realize(&pid_speed, (float)encoder_left.diff_cnt);
++    right_pwm = speed_pid_realize(&pid_speed2, (float)encoder_right.diff_cnt);
++
++    left_pwm = Limit_Float(left_pwm, -PWM_OUTPUT_LIMIT, PWM_OUTPUT_LIMIT);
++    right_pwm = Limit_Float(right_pwm, -PWM_OUTPUT_LIMIT, PWM_OUTPUT_LIMIT);
++
++    SpeedL = (int)left_pwm;
++    SpeedR = (int)right_pwm;
++    Motor_SetSpeed(MOTOR_LEFT, (int16_t)SpeedL);
++    Motor_SetSpeed(MOTOR_RIGHT, (int16_t)SpeedR);
+ }
+ 
+ /**
+-  * 函    数：Pid_Yaw
+-  * 说    明：根据灰度位置误差计算左右轮差速修正量
+-  * 参    数：Target 灰度角度目标值，通常为 0
+-  * 返 回 值：无，结果写入全局变量 Output_Yaw
++  * @brief  停止底盘电机并清空左右速度环状态。
++  * @retval 无。
+   */
+-void Pid_Yaw(float Target)
++static void Cascade_Stop(void)
+ {
+-    Yaw_Now_Correct = result_angle;
+-    Err_Yaw = Target - Yaw_Now_Correct;
+-    Integral_Yaw += Err_Yaw;
+-    if (Integral_Yaw > INTEGRAL_MAX)
+-        Integral_Yaw = INTEGRAL_MAX;
+-    if (Integral_Yaw < INTEGRAL_MIN)
+-        Integral_Yaw = INTEGRAL_MIN;
+-    Output_Yaw = (((Kp_Yaw * Err_Yaw) / 1024) +
+-                  ((Kd_Yaw * (Err_Yaw - LastErr_Yaw)) / 1024) +
+-                  ((Ki_Yaw * Integral_Yaw) / 1024));
+-    LastErr_Yaw = Err_Yaw;
+-    if (Output_Yaw > max)
+-        Output_Yaw = max;
+-    if (Output_Yaw < -max)
+-        Output_Yaw = -max;
++    PID_Reset(&pid_speed);
++    PID_Reset(&pid_speed2);
++    Speed_Set = 0;
++    SpeedL = 0;
++    SpeedR = 0;
++    Motor_Stop();
+ }
+ 
+ /**
+-  * 函    数：Angle_Hold_Reset_To_Zero
+-  * 说    明：向维特陀螺仪发送硬件清零命令，并重置角度环内部状态
+-  * 返 回 值：无
++  * @brief  执行一次 10ms 黑线循迹控制。
++  * @note   灰度数字量为 0 时判定丢线，并立即停止底盘。
++  * @retval 无。
+   */
+-void Angle_Hold_Reset_To_Zero(void)
++static void Line_Follow_Control_10ms(void)
+ {
+-    JY61p_HardwareZeroYaw();
+-    pid_angle.target_val = 0.0f;
+-    pid_angle.err = 0.0f;
+-    pid_angle.err_last = 0.0f;
+-    pid_angle.integral = 0.0f;
+-    pid_angle.err_prev = 0.0f;
+-    pid_angle.output = 0.0f;
++    float turn_output;
++    float left_target_speed;
++    float right_target_speed;
++
++    if (Digtal == 0U)
++    {
++        Gray_flag = 0;
++        PID_Clear_State(&pid_graysensor);
++        Cascade_Stop();
++        return;
++    }
++
++    Gray_flag = 1;
++    set_pid_target(&pid_graysensor, 0.0f);
++    turn_output = gray_pid_realize(&pid_graysensor, (float)result_angle);
++    turn_output = Limit_Float(turn_output, -LINE_TURN_LIMIT, LINE_TURN_LIMIT);
++
++    Speed_Set = (int)LINE_BASE_SPEED;
++    left_target_speed = LINE_BASE_SPEED - turn_output;
++    right_target_speed = LINE_BASE_SPEED + turn_output;
++    Cascade_Speed_Output(left_target_speed, right_target_speed);
+ }
+ 
+ /**
+-  * 函    数：Angle_Hold_PID_Reset_Only
+-  * 说    明：只清空角度环 PID 状态，不发送陀螺仪清零命令
+-  * 返 回 值：无
++  * @brief  从干净状态启动当前运行模式或 PID 调试模式。
++  * @retval 无。
+   */
+-void Angle_Hold_PID_Reset_Only(void)
++void Control_Start(void)
+ {
++    PID_Debug_Stop();
++    Encoder_ResetDistance();
+ 
++    Location_flag = 0;
++    Angle_flag = 0;
++    Gray_flag = (Car_Mode == Run_Mode) ? 1U : 0U;
++    car_go = 1;
+ }
+ 
+ /**
+-  * 函    数：Cascade_Speed_Output
+-  * 说    明：速度内环入口，把左右轮目标速度转换为 PWM 输出
+-  * 参    数：left_target_speed  左轮目标速度
+-  * 参    数：right_target_speed 右轮目标速度
+-  * 返 回 值：无
++  * @brief  停止底盘并清空当前控制状态。
++  * @retval 无。
+   */
+-static void Cascade_Speed_Output(float left_target_speed, float right_target_speed)
++void Control_Stop(void)
+ {
+-    float left_pwm;
+-    float right_pwm;
+-    left_target_speed = Limit_Float(left_target_speed, -SPEED_TARGET_MAX, SPEED_TARGET_MAX);
+-    right_target_speed = Limit_Float(right_target_speed, -SPEED_TARGET_MAX, SPEED_TARGET_MAX);
+-    set_pid_target(&pid_speed, left_target_speed);
+-    set_pid_target(&pid_speed2, right_target_speed);
+-    left_pwm = speed_pid_realize(&pid_speed, (float)encoder_left.diff_cnt);
+-    right_pwm = speed_pid_realize(&pid_speed2, (float)encoder_right.diff_cnt);
+-    left_pwm = Limit_Float(left_pwm, -PWM_OUTPUT_MAX, PWM_OUTPUT_MAX); 
+-    right_pwm = Limit_Float(right_pwm, -PWM_OUTPUT_MAX, PWM_OUTPUT_MAX);
+-    SpeedL = (int)left_pwm;
+-    SpeedR = (int)right_pwm;
+-    Motor_SetSpeed(MOTOR_LEFT, SpeedL);
+-    Motor_SetSpeed(MOTOR_RIGHT, SpeedR);
++    car_go = 0;
++    Location_flag = 0;
++    Angle_flag = 0;
++    Gray_flag = 0;
++    PID_Debug_Stop();
+ }
+ 
+ /**
+-  * 函    数：Cascade_Stop
+-  * 说    明：滑行停车，清空速度环并将左右轮 PWM 置 0
+-  * 返 回 值：无
++  * @brief  复位底盘任务、编码器里程和陀螺仪航向零点。
++  * @retval 无。
+   */
+-static void Cascade_Stop(void)
++void Control_Reset(void)
+ {
+-    PID_Reset(&pid_speed);
+-    PID_Reset(&pid_speed2);
+-    Speed_Set = 0;
+-    SpeedL = 0;
+-    SpeedR = 0;
+-    Motor_SetSpeed(MOTOR_LEFT, 0);
+-    Motor_SetSpeed(MOTOR_RIGHT, 0);
++    Control_Stop();
++    Encoder_ResetDistance();
++    JY61p_HardwareZeroYaw();
+ }
+ 
+ /**
+-  * 函    数：PID_Debug_Stop
+-  * 说    明：停止 PID 调试模式，清空各环 PID 状态，并让电机滑行停下
+-  * 返 回 值：无
++  * @brief  停止 PID 调试，清空全部 PID 状态并停止电机。
++  * @retval 无。
+   */
+ void PID_Debug_Stop(void)
+ {
+@@ -186,6 +143,8 @@ void PID_Debug_Stop(void)
+     PID_Clear_State(&pid_speed2);
+     PID_Clear_State(&pid_location);
+     PID_Clear_State(&pid_angle);
++    PID_Clear_State(&pid_graysensor);
++
+     Speed_Set = 0;
+     SpeedL = 0;
+     SpeedR = 0;
+@@ -193,47 +152,52 @@ void PID_Debug_Stop(void)
+ }
+ 
+ /**
+-  * 函    数：PID_Debug_Control_10ms
+-  * 说    明：野火 PID 助手调试入口，由 TIM7 每 10ms 调用一次
+-  * 返 回 值：无
++  * @brief  执行一次 10ms 野火 PID 助手调试控制。
++  * @note   Run_Mode 单独由固定基础速度循迹控制器处理。
++  * @retval 无。
+   */
+ void PID_Debug_Control_10ms(void)
+ {
+     float base_speed;
+-    float angle_out;
+-    float err;
++    float angle_output;
++
+     if (Car_Mode == Run_Mode)
+     {
+         return;
+     }
+-    if (car_go == 0)
++
++    if (car_go == 0U)
+     {
+         PID_Debug_Stop();
+         return;
+     }
++
+     switch (Car_Mode)
+     {
+     case Speed_Mode:
+         Speed_Set = (int)pid_speed.target_val;
+         Cascade_Speed_Output(pid_speed.target_val, 0.0f);
+         break;
++
+     case Speed2_Mode:
+         Speed_Set = (int)pid_speed2.target_val;
+         Cascade_Speed_Output(0.0f, pid_speed2.target_val);
+         break;
++
+     case Location_Mode:
+-    {
+         base_speed = location_pid_realize(&pid_location, pid_location.actual_val);
++        base_speed = Limit_Float(base_speed, -SPEED_TARGET_LIMIT, SPEED_TARGET_LIMIT);
+         Speed_Set = (int)base_speed;
+         Cascade_Speed_Output(base_speed, base_speed);
+         break;
+-    }
++
+     case Angle_Mode:
+-        angle_out = angle_pid_realize(&pid_angle, Yaw);
+-        angle_out = Limit_Float(angle_out, -TURN_TARGET_MAX, TURN_TARGET_MAX);
+-        Speed_Set = (int)angle_out;
+-        Cascade_Speed_Output(-angle_out, +angle_out);
++        angle_output = angle_pid_realize(&pid_angle, Yaw);
++        angle_output = Limit_Float(angle_output, -SPEED_TARGET_LIMIT, SPEED_TARGET_LIMIT);
++        Speed_Set = (int)angle_output;
++        Cascade_Speed_Output(-angle_output, angle_output);
+         break;
++
+     default:
+         PID_Debug_Stop();
+         break;
+@@ -241,135 +205,35 @@ void PID_Debug_Control_10ms(void)
+ }
+ 
+ /**
+-  * 函    数：Gray_Angle_From_Mask
+-  * 说    明：把 8 路灰度数字量掩码转换为灰度位置角度
+-  * 参    数：line_mask 当前灰度数字量位图
+-  * 返 回 值：归一化后的灰度角度值
++  * @brief  调度灰度计时、编码器采样和 10ms 控制环。
++  * @param  htim STM32 HAL 传入的定时器句柄。
++  * @retval 无。
+   */
+-static int Gray_Angle_From_Mask(uint8_t line_mask)
++void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+ {
+-    const int16_t weights[8] = {-7, -5, -3, -1, 1, 3, 5, 7};    
+-    int32_t weighted_sum = 0;
+-    uint8_t active_count = 0;
+-    uint8_t i;
+-
+-    for (i = 0; i < 8; i++)
++    if (htim->Instance == TIM6)
+     {
+-        if ((line_mask & (uint8_t)(1U << i)) != 0)
+-        {
+-            weighted_sum += (int32_t)weights[i] * 1024;
+-            active_count++;
+-        }
++        ZigbeeGrey_Tick();
+     }
+-
+-    if (active_count == 0)
++    else if (htim->Instance == TIM7)
+     {
+-        return 0;
+-    }
+-
+-    return (int)(weighted_sum / active_count);
+-}
+-
+-/**
+-  * 函    数：Motor_Control
+-  * 说    明：正式任务的主电机控制函数，组合位置环、灰度环和陀螺仪角度环
+-  * 返 回 值：无
+-  */
+-void Motor_Control(void)
+-{
+-    float base_speed;
+-    float gray_turn = 0.0f;
+-    float gyro_turn = 0.0f;
+-    float turn_speed = 0.0f;
+-    float gyro_angle_err = 0.0f;
+-    uint8_t line_mask = 0;
+-    float left_target_speed;
+-    float right_target_speed;
+-
+-    base_speed = location_pid_realize(&pid_location, pid_location.actual_val);
+-    base_speed = Limit_Float(base_speed, -distance_speed_target_max, distance_speed_target_max);
+-    Speed_Set = (int)base_speed;
+-
+-    if (Run_Dir == 1)
+-    {
+-        line_mask = Digtal;
+-        if (Gray_flag == 1 && far_t_slowdown_active == 0 && line_mask != 0)
+-        {
+-            result_angle = Gray_Angle_From_Mask(line_mask);
+-            Pid_Yaw(Tarangle);
+-            gray_turn = (float)Output_Yaw;
+-        }
+-        else
+-        {
+-            gray_turn = 0.0f;
+-            Reset_GrayYaw_State();
+-            base_speed = Limit_Float(base_speed, -40.0f, 40.0f);
+-        }
++        Encoder_Update();
++        pid_location.actual_val = Encoder_GetDistanceMm();
+ 
+-        gyro_angle_err = Angle_Error(pid_angle.target_val, Yaw);
+-        if (gyro_angle_err > -GYRO_ANGLE_DEADZONE &&
+-            gyro_angle_err < GYRO_ANGLE_DEADZONE)
++        if (Car_Mode == Run_Mode)
+         {
+-            gyro_turn = 0.0f;
+-            Reset_AnglePid_Output();
+-        }
+-        else
+-        {
+-            gyro_turn = angle_pid_realize(&pid_angle, Yaw);
+-            if (far_t_slowdown_active != 0)
++            if (car_go != 0U)
+             {
+-                gyro_turn *= FAR_T_GYRO_TURN_WEIGHT;
++                Line_Follow_Control_10ms();
+             }
+             else
+             {
+-                gyro_turn *= GYRO_TURN_WEIGHT;
++                Cascade_Stop();
+             }
+         }
+-        turn_speed = gray_turn + gyro_turn;
+-    }
+-    else
+-    {
+-        gyro_turn = angle_pid_realize(&pid_angle, Yaw);
+-        turn_speed = gyro_turn;
+-    }
+-
+-    turn_speed = Limit_Float(turn_speed, -TURN_TARGET_MAX, TURN_TARGET_MAX);
+-    left_target_speed = base_speed - turn_speed;
+-    right_target_speed = base_speed + turn_speed;
+-    Cascade_Speed_Output(left_target_speed, right_target_speed);
+-}
+-
+-/**
+-  * 函    数：HAL_TIM_PeriodElapsedCallback
+-  * 说    明：定时器中断回调，负责灰度 Tick、编码器更新与控制周期调度
+-  * 参    数：htim 触发中断的定时器句柄
+-  * 返 回 值：无
+-  */
+-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+-{
+-    if (htim->Instance == TIM5)
+-    {
+-    }
+-    if (htim->Instance == TIM6)
+-    {
+-        ZigbeeGrey_Tick();  // 1ms定时
+-    }
+-    if (htim->Instance == TIM7)
+-    {
+-        Encoder_Update();
+-        pid_location.actual_val = Encoder_GetDistanceMm();
+-        if (Car_Mode != Run_Mode)
+-        {      
+-            PID_Debug_Control_10ms();                      
+-            return;
+-        }
+-        if (car_go == 1 && Location_flag == 1 && Angle_flag == 0)
+-        {
+-            Motor_Control();
+-        }
+         else
+         {
+-            Cascade_Stop();
++            PID_Debug_Control_10ms();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Hardware/control.h b/Hardware/control.h
+index b240904..7ae43fa 100644
+--- a/Hardware/control.h
++++ b/Hardware/control.h
+@@ -1,55 +1,21 @@
+ #ifndef __CONTROL_H
+ #define __CONTROL_H
+-#include "headfile.h"
+ 
+-/* Vehicle and track geometry, unit: mm */
+-#define CAR_LENGTH 140
+-#define DASH_LINE_OFFSET 50
+-#define CENTER_OFFSET 150
++#include <stdint.h>
+ 
+-/* Near-room route distances */
+-// #define NEAR_STRAIGHT_DISTANCE 600
+-// #define NEAR_TO_MIDDLE_DISTANCE 400
+-#define NEAR_RUN1_DISTANCE 880
+-#define NEAR_RUN2_DISTANCE 320
+-#define NEAR_BACK1_DISTANCE 320
+-#define NEAR_BACK2_DISTANCE 540
+-
+-/* Middle-room route distances */
+-#define MIDDLE_RUN1_DISTANCE 1720
+-#define MIDDLE_RUN2_DISTANCE 360
+-#define MIDDLE_BACK1_DISTANCE 360
+-#define MIDDLE_BACK2_DISTANCE 1460
+-
+-/* Middle-to-far search route distances */
+-#define MIDDLE_TO_FAR_DISTANCE 908
+-#define FAR_SCAN_FRONT_DISTANCE 585
+-#define FAR_SCAN_REMAIN_DISTANCE (MIDDLE_TO_FAR_DISTANCE - FAR_SCAN_FRONT_DISTANCE)
+-#define FAR_SCAN_TIME_MS 1000
+-
+-/* Far-room route distances */
+-#define FAR_RUN1_DISTANCE 880
+-#define FAR_RUN2_DISTANCE 320
+-#define FAR_BACK1_DISTANCE 320
+-#define FAR_BACK2_DISTANCE 880
+-#define FAR_BACK3_DISTANCE 2360
+-uint8_t Distance_task(int16_t distance);
+-void task_1(void);
+-void task_2(void);
+-void task_search_middle_then_far(void);
+-void Angle_Hold_Reset_To_Zero(void);
+-void Control_Task_Reset(void);
++void Control_Start(void);
++void Control_Stop(void);
++void Control_Reset(void);
+ void PID_Debug_Control_10ms(void);
+ void PID_Debug_Stop(void);
+-extern uint8_t task_state;
+-extern int result_angle;
++
+ extern uint8_t car_go;
+ extern uint8_t Location_flag;
+ extern uint8_t Angle_flag;
+ extern uint8_t Gray_flag;
++
+ extern int Speed_Set;
+ extern int SpeedL;
+ extern int SpeedR;
+-extern int Output_Yaw;
+ 
+ #endif
+diff --git a/System/bsp_debug/bsp_debug.c b/System/bsp_debug/bsp_debug.c
+index 9ef0076..6eb5f95 100644
+--- a/System/bsp_debug/bsp_debug.c
++++ b/System/bsp_debug/bsp_debug.c
+@@ -269,14 +269,20 @@ void PID_Debug_OLED_Show(void)
+     {
+     case Run_Mode:
+         OLED_ShowLine(0, "MODE:RUN");
+-        sprintf(line, "GO:%d DIST:%ld", car_go, (long)Distance);
++        sprintf(line, "GO:%d LINE:%02X", car_go, Digtal);
+         OLED_ShowLine(1, line);
+-        sprintf(line, "L:%d R:%d", Motor1_Speed, Motor2_Speed);
++        sprintf(line, "ERR:%d OUT:%d", result_angle, (int)pid_graysensor.output);
+         OLED_ShowLine(2, line);
+-        sprintf(line, "YAW:%ld", (long)Yaw);
++        sprintf(line, "ENC L:%d R:%d", Motor1_Speed, Motor2_Speed);
+         OLED_ShowLine(3, line);
+-        sprintf(line, "R:%lu C:%lu X:%02X", (unsigned long)PID_Debug_RxCount, (unsigned long)PID_Debug_CmdCount, PID_Debug_LastCmd);
++        sprintf(line, "PWM L:%d R:%d", SpeedL, SpeedR);
+         OLED_ShowLine(4, line);
++        sprintf(line, "DIST:%ld", (long)Distance);
++        OLED_ShowLine(5, line);
++        sprintf(line, "YAW:%ld", (long)Yaw);
++        OLED_ShowLine(6, line);
++        sprintf(line, "R:%lu C:%lu X:%02X", (unsigned long)PID_Debug_RxCount, (unsigned long)PID_Debug_CmdCount, PID_Debug_LastCmd);
++        OLED_ShowLine(7, line);
+         break;
+ 
+     case Speed_Mode:
+@@ -339,4 +345,4 @@ void PID_Debug_OLED_Show(void)
+         OLED_ShowLine(0, "MODE:UNKNOWN");
+         break;
+     }
+-}
+\ No newline at end of file
++}

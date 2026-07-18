@@ -1,0 +1,18 @@
+id: jiguang_666
+name: 最后的激光
+name[zh]: 打靶框检测
+version: 2.2.0
+author: xjx
+icon: app.png
+desc: 检测靶框并显示中心坐标。
+exclude:
+  - __pycache__
+  - build
+  - dist
+files:
+  - 云台联调说明.md
+  - app.yaml
+  - best_npu.axmodel
+  - best_vnpu.axmodel
+  - best.mud
+  - main.py

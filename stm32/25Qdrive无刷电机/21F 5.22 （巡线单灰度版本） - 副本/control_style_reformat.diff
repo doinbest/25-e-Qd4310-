@@ -1,0 +1,3378 @@
+diff --git a/21F/21F/Core/Src/main.c b/21F/21F/Core/Src/main.c
+index 7975bed..c22e9e6 100644
+--- a/21F/21F/Core/Src/main.c
++++ b/21F/21F/Core/Src/main.c
+@@ -1,4 +1,4 @@
+-﻿/* USER CODE BEGIN Header */
++/* USER CODE BEGIN Header */
+ /**
+  ******************************************************************************
+  * @file           : main.c
+@@ -117,7 +117,7 @@ int main(void)
+   /* USER CODE BEGIN 2 */
+   /* Emergency-safe boot: reset must always send both gimbal motors zero
+      current and disable commands before any display or control startup. */
+-  Vision_Control_DisableAllMotors();
++  gimbal_disable_all();
+   delay_ms(100);
+   OLED_Init();
+   delay_ms(100);
+@@ -132,7 +132,7 @@ int main(void)
+   ZigbeeGrey_Init();
+   maixcam_Init(&huart3);
+   PID_param_init();
+-  Control_Reset();
++  control_reset();
+   HAL_TIM_Base_Start_IT(&htim5);
+   HAL_TIM_Base_Start_IT(&htim6);
+   HAL_TIM_Base_Start_IT(&htim7);
+@@ -148,8 +148,8 @@ int main(void)
+     /* 主循环只处理非实时任务，10ms 电机控制由 TIM7 调度。 */
+     key_scan();
+     ZigbeeGrey_Task_WithTick();
+-    Control_LineSensorUpdate();
+-    Vision_Control_Task();
++    control_line_sensor_update();
++    gimbal_task();
+     Protocol_Datas_Proc();
+     PID_Debug_OLED_Show();
+ 
+diff --git a/21F/21F/Hardware/KEY/bsp_key.c b/21F/21F/Hardware/KEY/bsp_key.c
+index aa7aa23..1ddb538 100644
+--- a/21F/21F/Hardware/KEY/bsp_key.c
++++ b/21F/21F/Hardware/KEY/bsp_key.c
+@@ -56,42 +56,42 @@ void key_scan(void)
+ 
+     if ((B1_State == 0U) && (B1_Last_State != 0U))
+     {
+-        if (car_go == 0U)
++        if (control_running == 0U)
+         {
+-            Control_NextLapTarget();
++            control_next_lap_target();
+         }
+     }
+ 
+     if ((B2_State == 0U) && (B2_Last_State != 0U))
+     {
+-        if (car_go == 0U)
++        if (control_running == 0U)
+         {
+-            Control_Reset();
+-            Control_Start();
++            control_reset();
++            control_start();
+         }
+     }
+ 
+     if ((B3_State == 0U) && (B3_Last_State != 0U))
+     {
+-        if ((Vision_Control_IsXMotorEnabled() != 0U) ||
+-            (Vision_Control_IsYMotorEnabled() != 0U))
++        if ((gimbal_x_motor_enabled() != 0U) ||
++            (gimbal_y_motor_enabled() != 0U))
+         {
+             /* B3 second press: stop visual control and de-energize both axes. */
+-            Vision_Control_DisableAllMotors();
++            gimbal_disable_all();
+             MaixCam_LaserOff();
+         }
+         else
+         {
+             MaixCam_LaserOn();
+-            Vision_Control_SetPixelDebugTarget(0U, 310.0f);
+-            Vision_Control_SetPixelDebugTarget(1U, 202.0f);
+-            Vision_Control_StartBothMotors();
++            gimbal_set_pixel_target(0U, 310.0f);
++            gimbal_set_pixel_target(1U, 202.0f);
++            gimbal_start_both();
+         }
+     }
+ 
+     if ((B4_State == 0U) && (B4_Last_State != 0U))
+     {
+-        Control_Stop();
++        control_stop();
+ 
+         if (Gray_Calibration_State != GRAY_CAL_WAIT_BLACK)
+         {
+@@ -110,7 +110,7 @@ void key_scan(void)
+ 
+     if ((B5_State == 0U) && (B5_Last_State != 0U))
+     {
+-        Control_CompetitionReset();
++        control_competition_reset();
+         /* Do not alter ZigbeeGrey_White/Black; only cancel a half-finished K4 flow. */
+         Gray_Calibration_State = GRAY_CAL_READY;
+     }
+diff --git a/21F/21F/Hardware/control.c b/21F/21F/Hardware/control.c
+index 9d12cc6..f6497f7 100644
+--- a/21F/21F/Hardware/control.c
++++ b/21F/21F/Hardware/control.c
+@@ -2,6 +2,8 @@
+ #include "headfile.h"
+ #include "qdrive/QD4310.h"
+ 
++#include <stdbool.h>
++
+ /* 所有车体运动量均使用 mm、mm/s；PWM 仍使用百分比。 */
+ #define SPEED_TARGET_LIMIT_MM_S       1100.0f   // 速度限速
+ #define LINE_TURN_LIMIT_MM_S           200.0f   // 直线巡线时的转向速度限速
+@@ -23,7 +25,6 @@
+ #define TURN_MIN_SPEED_MM_S               80.0f //  原地转向时的最小速度，单位 mm/s；用于角点识别后继续前进一段距离再转向。
+ #define TURN_STOP_TOLERANCE_MM            10.0f //  原地转向前的前进补偿阶段允许的误差范围，单位 mm；用于角点识别后继续前进一段距离再转向。
+ #define TURN_STOP_SPEED_MM_S               20.0f    //  原地转向前的前进补偿阶段的停车速度阈值，单位 mm/s；用于角点识别后继续前进一段距离再转向。
+-#define TURN_SPEED_MIN_MM_S                80.0f    //  原地转向时的最小速度，单位 mm/s；用于角点识别后继续前进一段距离再转向。
+ #define TURN_SPEED_MAX_MM_S               200.0f    //  原地转向时的最大速度，单位 mm/s；用于角点识别后继续前进一段距离再转向。 
+ #define TURN_FINISH_ERROR_DEG               2.0f    //  原地转向完成的航向误差阈值，单位度；用于角点识别后继续前进一段距离再转向。
+ #define FINISH_SLOW_DISTANCE_MM           200.0f    //  完成计圈后回到起点的减速距离阈值，单位 mm；用于角点识别后继续前进一段距离再转向。
+@@ -31,29 +32,12 @@
+ #define REACQUIRE_TIMEOUT_MS             1000U      //  原地转向后重新获取黑线的超时时间，单位 ms；用于角点识别后继续前进一段距离再转向。   
+ 
+ /* MaixCam视觉外环：X轴输出电流A，Y轴输出速度rpm。 */
+-#define VISION_OUTER_PERIOD_MS            10U       //  MaixCam视觉外环周期，单位 ms
+-#define VISION_INNER_PERIOD_MS            10U       //  MaixCam视觉内环周期，单位 ms
+-#define VISION_TARGET_TIMEOUT_MS         200U       //  MaixCam视觉靶心坐标超时阈值，单位 ms
+-#define VISION_X_IMU_TIMEOUT_MS            50U      // 维特角速度超时后立即让X轴电流归零。
+-#define VISION_FILTER_ALPHA             0.25f       //  MaixCam视觉低通滤波系数，0.0~1.0；越大响应越快，越小越平滑。
+-#define VISION_PIXEL_DEADBAND_PX          1.0f      //  MaixCam视觉像素误差死区，单位 px；在该范围内不输出控制量，避免抖动。
+-#define VISION_PIXEL_INTEGRAL_LIMIT      200.0f     //  MaixCam视觉像素积分限幅，单位 px；避免积分过大导致超调。
+-#define VISION_X_RATE_LIMIT_DPS           90.0f
+-#define VISION_X_RATE_INTEGRAL_LIMIT     300.0f
+-#define VISION_X_RATE_DEADBAND_DPS        0.2f
+-#define VISION_X_CURRENT_LIMIT_A           1.0f     //  MaixCam视觉X轴电流限幅，单位 A；避免电机过流。
++#define GIMBAL_PIXEL_FILTER_ALPHA             0.25f       //  MaixCam视觉低通滤波系数，0.0~1.0；越大响应越快，越小越平滑。
+ /* X axis current command slew limit, executed once per 10 ms inner period. */
+-#define VISION_X_CURRENT_RAMP_A_PER_10MS  0.05f
+-#define VISION_QD_SPEED_LIMIT_RPM          30.0f    //  MaixCam视觉QD4310电机速度限幅，单位 rpm；避免电机过速。
+-#define VISION_Y_SEARCH_SPEED_RPM         2.5f     // 反向修改前的搜索速度：沿 Y 轴正方向低速找靶。
+-#define VISION_Y_SEARCH_COMMAND_PERIOD_MS 100U
+-#define VISION_X_CURRENT_SIGN              1.0f     //  MaixCam视觉X轴电流方向符号，1.0f表示正向，-1.0f表示反向；用于调整电机正反转方向。
+-#define VISION_X_GYRO_SIGN                -1.0f     // X轴顺时针时WT61 GZ为负，取反后为正反馈。
+-#define VISION_Y_SPEED_SIGN                 1.0f    //  MaixCam视觉Y轴速度方向符号，1.0f表示正向，-1.0f表示反向；用于调整电机正反转方向。   
+-#define VISION_IMAGE_WIDTH_PX            640U   // MaixCam视觉图像宽度，单位 px
+-#define VISION_IMAGE_HEIGHT_PX           480U   //  MaixCam视觉图像高度，单位 px
+-#define VISION_IMAGE_CENTER_X_PX         320.0f //  MaixCam视觉图像中心 X 坐标，单位 px
+-#define VISION_IMAGE_CENTER_Y_PX         202.0f //  MaixCam视觉图像中心 Y 坐标，单位 px
++#define GIMBAL_IMAGE_WIDTH_PX            640U   // MaixCam视觉图像宽度，单位 px
++#define GIMBAL_IMAGE_HEIGHT_PX           480U   //  MaixCam视觉图像高度，单位 px
++#define GIMBAL_IMAGE_CENTER_X_PX         320.0f //  MaixCam视觉图像中心 X 坐标，单位 px
++#define GIMBAL_IMAGE_CENTER_Y_PX         202.0f //  MaixCam视觉图像中心 Y 坐标，单位 px
+ /* 若靶心越调越偏，只把对应宏由 1.0f 改为 -1.0f。 */
+ 
+ /* 当前陀螺仪：左转 Yaw 增大，右转 Yaw 减小。 */
+@@ -66,77 +50,74 @@ typedef struct
+ {
+     float previous_actual;
+     uint8_t zero_speed_reached;
+-} Speed_Control_State_t;
++} SpeedControlState;
+ 
+ typedef enum
+ {
+-    RUN_READY = 0,
+-    RUN_FOLLOW,
+-    RUN_APPROACH,
+-    RUN_STOP_FOR_TURN,
+-    RUN_TURN,
+-    RUN_REACQUIRE,
+-    RUN_LOST,
+-    RUN_DONE
+-} Run_State_t;
+-
+-static const float Line_Speed_Gears[LINE_SPEED_GEAR_COUNT] =
++    LINE_READY = 0,
++    LINE_FOLLOW,
++    LINE_APPROACH,
++    LINE_STOP_FOR_TURN,
++    LINE_TURN,
++    LINE_REACQUIRE,
++    LINE_LOST,
++    LINE_DONE
++} LineState;
++
++static const float line_speed_gears[LINE_SPEED_GEAR_COUNT] =
+     {300.0f, 400.0f, 500.0f};
+-static uint8_t Speed_Gear_Index = 0U;
+-static uint8_t Target_Lap = 1U;
+-static uint8_t Lap_Done = 0U;
+-static uint8_t Turn_Done = 0U;
+-static int8_t Run_Direction = 0;
+-static int8_t Corner_Direction = 0;
+-static Run_State_t Run_State = RUN_READY;
+-static float Corner_Start_DistanceMm = 0.0f;
+-static float Corner_Ignore_UntilMm = 0.0f;
+-static float Turn_Target_Yaw = 0.0f;
+-static float Turn_Start_Raw_DistanceMm = 0.0f;
+-static float Turn_Distance_OffsetMm = 0.0f;
+-static uint8_t Corner_Confirm_Count = 0U;
+-static uint8_t Reacquire_Confirm_Count = 0U;
+-static uint32_t Reacquire_Start_Tick = 0U;
+-static uint32_t Last_Grey_Sample = 0U;
+-
+-static Speed_Control_State_t Left_Speed_State = {0.0f, 0U};
+-static Speed_Control_State_t Right_Speed_State = {0.0f, 0U};
++static uint8_t speed_gear_index = 0U;
++static uint8_t target_lap = 1U;
++static uint8_t lap_done = 0U;
++static uint8_t turn_done = 0U;
++static int8_t run_direction = 0;
++static int8_t corner_direction = 0;
++static LineState line_state = LINE_READY;
++static float corner_start_distance_mm = 0.0f;
++static float corner_ignore_until_mm = 0.0f;
++static float turn_target_yaw_deg = 0.0f;
++static float turn_start_raw_distance_mm = 0.0f;
++static float turn_distance_offset_mm = 0.0f;
++static uint8_t corner_confirm_count = 0U;
++static uint8_t reacquire_confirm_count = 0U;
++static uint32_t reacquire_start_tick_ms = 0U;
++static uint32_t last_gray_sample = 0U;
++
++static SpeedControlState left_speed_state = {0.0f, 0U};
++static SpeedControlState right_speed_state = {0.0f, 0U};
+ /* X 轴使用 USART2，Y 轴使用 UART5；两台 QD4310 分别独占串口，ID 都是 0。 */
+-static QD4310_t Vision_Motor_X = {false, 0U, 0.0f, 0.0f, 0.0f, &huart2};
+-static QD4310_t Vision_Motor_Y = {false, 0U, 0.0f, 0.0f, 0.0f, &huart5};
+-static uint8_t Vision_Control_Active = 0U;
+-static uint8_t Vision_X_Motor_Enabled = 0U;
+-static uint8_t Vision_Y_Motor_Enabled = 0U;
+-static uint8_t Vision_Target_Lost = 0U;
+-static uint8_t Vision_Rate_Debug_Active = 0U;
+-static uint8_t Vision_Selected_Task_Mode = 1U;
++static QD4310_t gimbal_motor_x = {false, 0U, 0.0f, 0.0f, 0.0f, &huart2};
++static QD4310_t gimbal_motor_y = {false, 0U, 0.0f, 0.0f, 0.0f, &huart5};
++static bool gimbal_active = false;
++static bool gimbal_x_enabled = false;
++static bool gimbal_y_enabled = false;
++static bool gimbal_target_lost = false;
++static bool gimbal_rate_debug = false;
++static uint8_t gimbal_task_mode = 1U;
+ 
+ /**
+  * @brief 获取仅包含直线阶段的累计里程。
+  * @note  原地转向期间左右轮不一致造成的净编码器里程会被扣除。
+  */
+-static float Get_Run_DistanceMm(void)
++static float get_run_distance_mm(void)
+ {
+-    return Encoder_GetDistanceMm() - Turn_Distance_OffsetMm;
++    return Encoder_GetDistanceMm() - turn_distance_offset_mm;
+ }
+ 
+-int SpeedL = 0;
+-int SpeedR = 0;
+-int Speed_Set = 0;
++int16_t left_pwm = 0;
++int16_t right_pwm = 0;
++int16_t speed_target_mm_s = 0;
+ int result_angle = 0;
+ 
+-uint8_t car_go = 0;
+-uint8_t Location_flag = 0;
+-uint8_t Angle_flag = 0;
+-uint8_t Gray_flag = 0;
++uint8_t control_running = 0;
+ 
+-static void Speed_Control_State_Reset(Speed_Control_State_t *state)
++static void speed_state_reset(SpeedControlState *state)
+ {
+     state->previous_actual = 0.0f;
+     state->zero_speed_reached = 0U;
+ }
+ 
+-static float Speed_Loop_Output(_pid *pid, Speed_Control_State_t *state,
++static float speed_loop_output(_pid *pid, SpeedControlState *state,
+                                float target_speed_mm_s, float actual_speed_mm_s,
+                                float output_limit)
+ {
+@@ -179,10 +160,10 @@ static float Speed_Loop_Output(_pid *pid, Speed_Control_State_t *state,
+     return output;
+ }
+ 
+-static void Cascade_Speed_Output(float left_target_mm_s, float right_target_mm_s)
++static void set_wheel_speed(float left_target_mm_s, float right_target_mm_s)
+ {
+-    float left_pwm;
+-    float right_pwm;
++    float left_output_pwm;
++    float right_output_pwm;
+     float left_limit;
+     float right_limit;
+ 
+@@ -196,30 +177,30 @@ static void Cascade_Speed_Output(float left_target_mm_s, float right_target_mm_s
+     left_limit = (left_target_mm_s == 0.0f) ? ZERO_SPEED_BRAKE_PWM_LIMIT : PWM_OUTPUT_LIMIT;
+     right_limit = (right_target_mm_s == 0.0f) ? ZERO_SPEED_BRAKE_PWM_LIMIT : PWM_OUTPUT_LIMIT;
+ 
+-    left_pwm = Speed_Loop_Output(&pid_speed, &Left_Speed_State,
+-                                 left_target_mm_s, encoder_left.speed_mm_s, left_limit);
+-    right_pwm = Speed_Loop_Output(&pid_speed2, &Right_Speed_State,
+-                                  right_target_mm_s, encoder_right.speed_mm_s, right_limit);
++    left_output_pwm = speed_loop_output(&pid_speed, &left_speed_state,
++                                        left_target_mm_s, encoder_left.speed_mm_s, left_limit);
++    right_output_pwm = speed_loop_output(&pid_speed2, &right_speed_state,
++                                         right_target_mm_s, encoder_right.speed_mm_s, right_limit);
+ 
+-    SpeedL = (int)Limit_Float(left_pwm, -left_limit, left_limit);
+-    SpeedR = (int)Limit_Float(right_pwm, -right_limit, right_limit);
+-    Motor_SetSpeed(MOTOR_LEFT, (int16_t)SpeedL);
+-    Motor_SetSpeed(MOTOR_RIGHT, (int16_t)SpeedR);
++    left_pwm = (int16_t)Limit_Float(left_output_pwm, -left_limit, left_limit);
++    right_pwm = (int16_t)Limit_Float(right_output_pwm, -right_limit, right_limit);
++    Motor_SetSpeed(MOTOR_LEFT, (int16_t)left_pwm);
++    Motor_SetSpeed(MOTOR_RIGHT, (int16_t)right_pwm);
+ }
+ 
+-static void Cascade_Stop(void)
++static void stop_chassis(void)
+ {
+     PID_Reset(&pid_speed);
+     PID_Reset(&pid_speed2);
+-    Speed_Control_State_Reset(&Left_Speed_State);
+-    Speed_Control_State_Reset(&Right_Speed_State);
+-    Speed_Set = 0;
+-    SpeedL = 0;
+-    SpeedR = 0;
++    speed_state_reset(&left_speed_state);
++    speed_state_reset(&right_speed_state);
++    speed_target_mm_s = 0;
++    left_pwm = 0;
++    right_pwm = 0;
+     Motor_Stop();
+ }
+ 
+-static uint8_t Get_Black_Count(void)
++static uint8_t get_black_count(void)
+ {
+     uint8_t count = 0U;
+     uint8_t i;
+@@ -234,49 +215,46 @@ static uint8_t Get_Black_Count(void)
+     return count;
+ }
+ 
+-static int8_t Get_Corner_Direction(void)
++static int8_t get_corner_direction(void)
+ {
+     /* 传感器 1~8 从左到右；归一化位置小于零即黑线偏左。 */
+     return (result_angle < 0) ? TURN_LEFT : TURN_RIGHT;
+ }
+ 
+-static const char *Get_State_Text(void)
++static const char *get_line_state_text(void)
+ {
+-    switch (Run_State)
++    switch (line_state)
+     {
+-    case RUN_FOLLOW: return "FOLLOW";
+-    case RUN_APPROACH: return "APPROACH";
+-    case RUN_STOP_FOR_TURN: return "STOP";
+-    case RUN_TURN: return "TURN";
+-    case RUN_REACQUIRE: return "FIND";
+-    case RUN_LOST: return "LOST";
+-    case RUN_DONE: return "DONE";
++    case LINE_FOLLOW: return "FOLLOW";
++    case LINE_APPROACH: return "APPROACH";
++    case LINE_STOP_FOR_TURN: return "STOP";
++    case LINE_TURN: return "TURN";
++    case LINE_REACQUIRE: return "FIND";
++    case LINE_LOST: return "LOST";
++    case LINE_DONE: return "DONE";
+     default: return "READY";
+     }
+ }
+ 
+-static void Line_Follow_Control_10ms(float base_speed_mm_s)
++static void line_follow_update(float base_speed_mm_s)
+ {
+     float turn_speed_mm_s;
+ 
+     if (Digtal == 0U)
+     {
+-        Run_State = RUN_LOST;
+-        car_go = 0U;
+-        Gray_flag = 0U;
+-        Cascade_Stop();
++        line_state = LINE_LOST;
++        control_running = 0U;
++stop_chassis();
+         return;
+     }
+-
+-    Gray_flag = 1U;
+-    set_pid_target(&pid_graysensor, 0.0f);
++set_pid_target(&pid_graysensor, 0.0f);
+     turn_speed_mm_s = gray_pid_realize(&pid_graysensor, (float)result_angle);
+     turn_speed_mm_s = Limit_Float(turn_speed_mm_s,
+                                   -LINE_TURN_LIMIT_MM_S,
+                                   LINE_TURN_LIMIT_MM_S);
+ 
+-    Speed_Set = (int)base_speed_mm_s;
+-    Cascade_Speed_Output(base_speed_mm_s - turn_speed_mm_s,
++    speed_target_mm_s = (int)base_speed_mm_s;
++    set_wheel_speed(base_speed_mm_s - turn_speed_mm_s,
+                          base_speed_mm_s + turn_speed_mm_s);
+ }
+ 
+@@ -284,137 +262,135 @@ static void Line_Follow_Control_10ms(float base_speed_mm_s)
+  * @brief 灰度 PID 上位机调参时的直线巡线控制。
+  * @note  不进入计圈、角点识别状态机；基础速度由 B4 选择。
+  */
+-static void Gray_Debug_Control_10ms(void)
++static void gray_debug_update(void)
+ {
+     float base_speed_mm_s;
+     float turn_speed_mm_s;
+ 
+     if (Digtal == 0U)
+     {
+-        car_go = 0U;
+-        Gray_flag = 0U;
+-        Cascade_Stop();
++        control_running = 0U;
++stop_chassis();
+         return;
+     }
+ 
+-    base_speed_mm_s = Control_GetLineBaseSpeed();
+-    Gray_flag = 1U;
+-    set_pid_target(&pid_graysensor, 0.0f);
++    base_speed_mm_s = control_get_line_speed_mm_s();
++set_pid_target(&pid_graysensor, 0.0f);
+     turn_speed_mm_s = gray_pid_realize(&pid_graysensor, (float)result_angle);
+     turn_speed_mm_s = Limit_Float(turn_speed_mm_s,
+                                   -LINE_TURN_LIMIT_MM_S,
+                                   LINE_TURN_LIMIT_MM_S);
+ 
+-    Speed_Set = (int)base_speed_mm_s;
+-    Cascade_Speed_Output(base_speed_mm_s - turn_speed_mm_s,
++    speed_target_mm_s = (int)base_speed_mm_s;
++    set_wheel_speed(base_speed_mm_s - turn_speed_mm_s,
+                          base_speed_mm_s + turn_speed_mm_s);
+ }
+ 
+-static void Start_Turn(void)
++static void start_turn(void)
+ {
+-    Turn_Start_Raw_DistanceMm = Encoder_GetDistanceMm();
+-    Turn_Target_Yaw = Yaw + (float)Corner_Direction * GYRO_LEFT_SIGN * 90.0f;
+-    while (Turn_Target_Yaw > 180.0f) Turn_Target_Yaw -= 360.0f;
+-    while (Turn_Target_Yaw <= -180.0f) Turn_Target_Yaw += 360.0f;
++    turn_start_raw_distance_mm = Encoder_GetDistanceMm();
++    turn_target_yaw_deg = Yaw + (float)corner_direction * GYRO_LEFT_SIGN * 90.0f;
++    while (turn_target_yaw_deg > 180.0f) turn_target_yaw_deg -= 360.0f;
++    while (turn_target_yaw_deg <= -180.0f) turn_target_yaw_deg += 360.0f;
+ 
+     PID_Clear_State(&pid_angle);
+-    set_pid_target(&pid_angle, Turn_Target_Yaw);
+-    Run_State = RUN_TURN;
++    set_pid_target(&pid_angle, turn_target_yaw_deg);
++    line_state = LINE_TURN;
+ }
+ 
+-static void Finish_Turn(void)
++static void finish_turn(void)
+ {
+     /* 删除本次原地转向造成的净编码器里程，巡线总里程只统计直线。 */
+-    Turn_Distance_OffsetMm +=
+-        Encoder_GetDistanceMm() - Turn_Start_Raw_DistanceMm;
+-
+-    Turn_Done++;
+-    Lap_Done = Turn_Done / TURNS_PER_LAP;
+-    Corner_Ignore_UntilMm = Get_Run_DistanceMm() + CORNER_REARM_DISTANCE_MM;
+-    Reacquire_Confirm_Count = 0U;
+-    Reacquire_Start_Tick = HAL_GetTick();
++    turn_distance_offset_mm +=
++        Encoder_GetDistanceMm() - turn_start_raw_distance_mm;
++
++    turn_done++;
++    lap_done = turn_done / TURNS_PER_LAP;
++    corner_ignore_until_mm = get_run_distance_mm() + CORNER_REARM_DISTANCE_MM;
++    reacquire_confirm_count = 0U;
++    reacquire_start_tick_ms = HAL_GetTick();
+     PID_Clear_State(&pid_graysensor);
+ 
+-    Run_State = RUN_REACQUIRE;
++    line_state = LINE_REACQUIRE;
+ }
+ 
+ /**
+  * @brief 到达累计目标距离后结束任务，停车点即为起始位置。
+  */
+-static void Finish_At_Start(void)
++static void finish_at_start(void)
+ {
+-    Lap_Done = Target_Lap;
+-    Run_State = RUN_DONE;
+-    car_go = 0U;
+-    Cascade_Stop();
++    lap_done = target_lap;
++    line_state = LINE_DONE;
++    control_running = 0U;
++    stop_chassis();
+ }
+ 
+-static void Run_Line_Control_10ms(void)
++static void line_control_update(void)
+ {
+     float moved_mm;
+     float remain_mm;
+     float target_speed_mm_s;
+     float angle_output_mm_s;
+ 
+-    switch (Run_State)
++    switch (line_state)
+     {
+-    case RUN_FOLLOW:
++    case LINE_FOLLOW:
+         /* 只有完成全部 4 x 圈数 个角点转向后，才开始按总里程回到起点。 */
+-        if (Turn_Done >= (uint8_t)(Target_Lap * TURNS_PER_LAP))
++        if (turn_done >= (uint8_t)(target_lap * TURNS_PER_LAP))
+         {
+-            remain_mm = (float)Target_Lap * LAP_DISTANCE_MM -
+-                        Get_Run_DistanceMm();
++            remain_mm = (float)target_lap * LAP_DISTANCE_MM -
++                        get_run_distance_mm();
+             if (remain_mm <= FINISH_STOP_TOLERANCE_MM)
+             {
+-                Finish_At_Start();
++                finish_at_start();
+             }
+             else if (remain_mm < FINISH_SLOW_DISTANCE_MM)
+             {
+                 target_speed_mm_s = Limit_Float(remain_mm * 1.5f,
+                                                  TURN_MIN_SPEED_MM_S,
+                                                  TURN_APPROACH_SPEED_MM_S);
+-                Line_Follow_Control_10ms(target_speed_mm_s);
++                line_follow_update(target_speed_mm_s);
+             }
+             else
+             {
+-                Line_Follow_Control_10ms(Line_Speed_Gears[Speed_Gear_Index]);
++                line_follow_update(line_speed_gears[speed_gear_index]);
+             }
+         }
+         else
+         {
+-            Line_Follow_Control_10ms(Line_Speed_Gears[Speed_Gear_Index]);
++            line_follow_update(line_speed_gears[speed_gear_index]);
+         }
+         break;
+ 
+-    case RUN_APPROACH:
+-        moved_mm = Get_Run_DistanceMm() - Corner_Start_DistanceMm;
++    case LINE_APPROACH:
++        moved_mm = get_run_distance_mm() - corner_start_distance_mm;
+         remain_mm = TURN_COMPENSATION_MM - moved_mm;
+ 
+         /* 单向前进补偿：进入目标前 ±10 mm 范围或略微越过目标即可转向。 */
+         if (remain_mm <= TURN_STOP_TOLERANCE_MM)
+         {
+-            Run_State = RUN_STOP_FOR_TURN;
+-            Cascade_Speed_Output(0.0f, 0.0f);
++            line_state = LINE_STOP_FOR_TURN;
++            set_wheel_speed(0.0f, 0.0f);
+             break;
+         }
+         /* 从检测到角点起就降低速度，末端进一步按剩余距离减速。 */
+         target_speed_mm_s = Limit_Float(remain_mm * 1.5f,
+                                         TURN_MIN_SPEED_MM_S,
+                                         TURN_APPROACH_SPEED_MM_S);
+-        Speed_Set = (int)target_speed_mm_s;
+-        Cascade_Speed_Output(target_speed_mm_s, target_speed_mm_s);
++        speed_target_mm_s = (int)target_speed_mm_s;
++        set_wheel_speed(target_speed_mm_s, target_speed_mm_s);
+         break;
+ 
+-    case RUN_STOP_FOR_TURN:
+-        Cascade_Speed_Output(0.0f, 0.0f);
++    case LINE_STOP_FOR_TURN:
++        set_wheel_speed(0.0f, 0.0f);
+         if ((fabsf(encoder_left.speed_mm_s) <= TURN_STOP_SPEED_MM_S) &&
+             (fabsf(encoder_right.speed_mm_s) <= TURN_STOP_SPEED_MM_S))
+         {
+-            Start_Turn();
++            start_turn();
+         }
+         break;
+ 
+-    case RUN_TURN:
++    case LINE_TURN:
+         angle_output_mm_s = angle_pid_realize(&pid_angle, Yaw);
+         angle_output_mm_s = Limit_Float(angle_output_mm_s,
+                                          -TURN_SPEED_MAX_MM_S,
+@@ -422,139 +398,139 @@ static void Run_Line_Control_10ms(void)
+ 
+         if (fabsf(pid_angle.err) <= TURN_FINISH_ERROR_DEG)
+         {
+-            Cascade_Stop();
+-            Finish_Turn();
++            stop_chassis();
++            finish_turn();
+             break;
+         }
+ 
+-        Speed_Set = (int)angle_output_mm_s;
+-        Cascade_Speed_Output(-angle_output_mm_s, angle_output_mm_s);
++        speed_target_mm_s = (int)angle_output_mm_s;
++        set_wheel_speed(-angle_output_mm_s, angle_output_mm_s);
+         break;
+ 
+-    case RUN_REACQUIRE:
+-        if ((HAL_GetTick() - Reacquire_Start_Tick) >= REACQUIRE_TIMEOUT_MS)
++    case LINE_REACQUIRE:
++        if ((HAL_GetTick() - reacquire_start_tick_ms) >= REACQUIRE_TIMEOUT_MS)
+         {
+-            Run_State = RUN_LOST;
+-            car_go = 0U;
+-            Cascade_Stop();
++            line_state = LINE_LOST;
++            control_running = 0U;
++            stop_chassis();
+         }
+         else
+         {
+             /* 转角后允许短暂全白，低速直行等待下一段线进入传感器。 */
+             if (Digtal == 0U)
+             {
+-                Cascade_Speed_Output(TURN_APPROACH_SPEED_MM_S,
++                set_wheel_speed(TURN_APPROACH_SPEED_MM_S,
+                                      TURN_APPROACH_SPEED_MM_S);
+             }
+             else
+             {
+-                Line_Follow_Control_10ms(TURN_APPROACH_SPEED_MM_S);
++                line_follow_update(TURN_APPROACH_SPEED_MM_S);
+             }
+         }
+         break;
+ 
+-    case RUN_LOST:
+-    case RUN_DONE:
+-    case RUN_READY:
++    case LINE_LOST:
++    case LINE_DONE:
++    case LINE_READY:
+     default:
+-        Cascade_Stop();
++        stop_chassis();
+         break;
+     }
+ }
+ 
+-void Control_LineSensorUpdate(void)
++void control_line_sensor_update(void)
+ {
+     uint8_t black_count;
+     float distance_mm;
+ 
+-    if (Last_Grey_Sample == ZigbeeGrey_SampleCount)
++    if (last_gray_sample == ZigbeeGrey_SampleCount)
+     {
+         return;
+     }
+-    Last_Grey_Sample = ZigbeeGrey_SampleCount;
++    last_gray_sample = ZigbeeGrey_SampleCount;
+ 
+-    if ((car_go == 0U) || (Car_Mode != Run_Mode))
++    if ((control_running == 0U) || (Car_Mode != Run_Mode))
+     {
+         return;
+     }
+ 
+-    black_count = Get_Black_Count();
+-    distance_mm = Get_Run_DistanceMm();
++    black_count = get_black_count();
++    distance_mm = get_run_distance_mm();
+ 
+-    if (Run_State == RUN_REACQUIRE)
++    if (line_state == LINE_REACQUIRE)
+     {
+         if ((Digtal != 0U) && (black_count < CORNER_BLACK_COUNT_MIN))
+         {
+-            Reacquire_Confirm_Count++;
+-            if (Reacquire_Confirm_Count >= CORNER_CONFIRM_SAMPLE_COUNT)
++            reacquire_confirm_count++;
++            if (reacquire_confirm_count >= CORNER_CONFIRM_SAMPLE_COUNT)
+             {
+-                Run_State = RUN_FOLLOW;
++                line_state = LINE_FOLLOW;
+             }
+         }
+         else
+         {
+-            Reacquire_Confirm_Count = 0U;
++            reacquire_confirm_count = 0U;
+         }
+         return;
+     }
+ 
+-    if ((Run_State != RUN_FOLLOW) || (distance_mm < Corner_Ignore_UntilMm))
++    if ((line_state != LINE_FOLLOW) || (distance_mm < corner_ignore_until_mm))
+     {
+         return;
+     }
+ 
+     if (black_count >= CORNER_BLACK_COUNT_MIN)
+     {
+-        Corner_Confirm_Count++;
+-        if (Corner_Confirm_Count >= CORNER_CONFIRM_SAMPLE_COUNT)
++        corner_confirm_count++;
++        if (corner_confirm_count >= CORNER_CONFIRM_SAMPLE_COUNT)
+         {
+-            Corner_Direction = (Run_Direction == 0) ? Get_Corner_Direction() : Run_Direction;
+-            if (Run_Direction == 0)
++            corner_direction = (run_direction == 0) ? get_corner_direction() : run_direction;
++            if (run_direction == 0)
+             {
+-                Run_Direction = Corner_Direction;
++                run_direction = corner_direction;
+             }
+ 
+-            Corner_Start_DistanceMm = distance_mm;
+-            Corner_Confirm_Count = 0U;
++            corner_start_distance_mm = distance_mm;
++            corner_confirm_count = 0U;
+             PID_Clear_State(&pid_graysensor);
+-            Run_State = RUN_APPROACH;
++            line_state = LINE_APPROACH;
+         }
+     }
+     else
+     {
+-        Corner_Confirm_Count = 0U;
++        corner_confirm_count = 0U;
+     }
+ }
+ 
+-void Control_NextSpeedGear(void)
++void control_next_speed_gear(void)
+ {
+-    Speed_Gear_Index = (uint8_t)((Speed_Gear_Index + 1U) % LINE_SPEED_GEAR_COUNT);
++    speed_gear_index = (uint8_t)((speed_gear_index + 1U) % LINE_SPEED_GEAR_COUNT);
+ }
+ 
+-uint8_t Control_GetSpeedGear(void)
++uint8_t control_get_speed_gear(void)
+ {
+-    return (uint8_t)(Speed_Gear_Index + 1U);
++    return (uint8_t)(speed_gear_index + 1U);
+ }
+ 
+-float Control_GetLineBaseSpeed(void)
++float control_get_line_speed_mm_s(void)
+ {
+-    return Line_Speed_Gears[Speed_Gear_Index];
++    return line_speed_gears[speed_gear_index];
+ }
+ 
+-uint8_t Control_NextLapTarget(void)
++uint8_t control_next_lap_target(void)
+ {
+-    Target_Lap++;
+-    if (Target_Lap > TARGET_LAP_MAX) Target_Lap = TARGET_LAP_MIN;
+-    return Target_Lap;
++    target_lap++;
++    if (target_lap > TARGET_LAP_MAX) target_lap = TARGET_LAP_MIN;
++    return target_lap;
+ }
+ 
+-uint8_t Control_GetLapTarget(void) { return Target_Lap; }
+-uint8_t Control_GetLapDone(void) { return Lap_Done; }
+-uint8_t Control_GetTurnDone(void) { return Turn_Done; }
+-float Control_GetRunDistanceMm(void) { return Get_Run_DistanceMm(); }
+-const char *Control_GetRunStateText(void) { return Get_State_Text(); }
++uint8_t control_get_lap_target(void) { return target_lap; }
++uint8_t control_get_lap_done(void) { return lap_done; }
++uint8_t control_get_turn_done(void) { return turn_done; }
++float control_get_run_distance_mm(void) { return get_run_distance_mm(); }
++const char *control_get_line_state_text(void) { return get_line_state_text(); }
+ 
+-void PID_Debug_Stop(void)
++void control_debug_stop(void)
+ {
+     PID_Clear_State(&pid_speed);
+     PID_Clear_State(&pid_speed2);
+@@ -563,1017 +539,83 @@ void PID_Debug_Stop(void)
+     PID_Clear_State(&pid_graysensor);
+     PID_Clear_State(&pid_dr4310X);
+     PID_Clear_State(&pid_dr4310Y);
+-    Speed_Control_State_Reset(&Left_Speed_State);
+-    Speed_Control_State_Reset(&Right_Speed_State);
+-    Speed_Set = 0;
+-    SpeedL = 0;
+-    SpeedR = 0;
++    speed_state_reset(&left_speed_state);
++    speed_state_reset(&right_speed_state);
++    speed_target_mm_s = 0;
++    left_pwm = 0;
++    right_pwm = 0;
+     Motor_Stop();
+ }
+ 
+-void Control_Start(void)    //  
++void control_start(void)    //
+ {
+-    if (Run_State == RUN_LOST)
++    if (line_state == LINE_LOST)
+     {
+         return;
+     }
+ 
+-    PID_Debug_Stop();
++    control_debug_stop();
+     /* 每次任务从 B3 启动时仅清零一次航向，后续转角保持连续累计。 */
+     JY61p_HardwareZeroYaw();
+     Encoder_ResetDistance();
+-    Turn_Start_Raw_DistanceMm = 0.0f;
+-    Turn_Distance_OffsetMm = 0.0f;
+-    Lap_Done = 0U;
+-    Turn_Done = 0U;
+-    Run_Direction = 0;
+-    Corner_Direction = 0;
+-    Corner_Confirm_Count = 0U;
+-    Corner_Ignore_UntilMm = CORNER_REARM_DISTANCE_MM;
+-    Run_State = RUN_FOLLOW;
+-    Location_flag = 0U;
+-    Angle_flag = 0U;
+-    Gray_flag = 1U;
+-    car_go = 1U;
++    turn_start_raw_distance_mm = 0.0f;
++    turn_distance_offset_mm = 0.0f;
++    lap_done = 0U;
++    turn_done = 0U;
++    run_direction = 0;
++    corner_direction = 0;
++    corner_confirm_count = 0U;
++    corner_ignore_until_mm = CORNER_REARM_DISTANCE_MM;
++    line_state = LINE_FOLLOW;
++
++control_running = 1U;
+ }
+ 
+-void Control_Stop(void)
++void control_stop(void)
+ {
+-    car_go = 0U;
+-    Location_flag = 0U;
+-    Angle_flag = 0U;
+-    Gray_flag = 0U;
+-    if (Run_State != RUN_LOST)
++    control_running = 0U;
++
++if (line_state != LINE_LOST)
+     {
+-        Run_State = RUN_READY;
++        line_state = LINE_READY;
+     }
+-    PID_Debug_Stop();
++    control_debug_stop();
+ }
+ 
+-void Control_Reset(void)
++void control_reset(void)
+ {
+-    car_go = 0U;
+-    Lap_Done = 0U;
+-    Turn_Done = 0U;
+-    Run_Direction = 0;
+-    Corner_Direction = 0;
+-    Corner_Confirm_Count = 0U;
+-    Run_State = RUN_READY;
+-    PID_Debug_Stop();
++    control_running = 0U;
++    lap_done = 0U;
++    turn_done = 0U;
++    run_direction = 0;
++    corner_direction = 0;
++    corner_confirm_count = 0U;
++    line_state = LINE_READY;
++    control_debug_stop();
+     Encoder_ResetDistance();
+-    Turn_Start_Raw_DistanceMm = 0.0f;
+-    Turn_Distance_OffsetMm = 0.0f;
++    turn_start_raw_distance_mm = 0.0f;
++    turn_distance_offset_mm = 0.0f;
+     JY61p_HardwareZero();
+ }
+ 
+ /* K5 competition reset: preserve gray black/white calibration arrays. */
+-void Control_CompetitionReset(void)
++void control_competition_reset(void)
+ {
+-    Control_Reset();
+-    Target_Lap = TARGET_LAP_MIN;
+-    Location_flag = 0U;
+-    Angle_flag = 0U;
+-    Gray_flag = 0U;
+-    Car_Mode = Run_Mode;
++    control_reset();
++    target_lap = TARGET_LAP_MIN;
+ 
+-    Vision_Control_DisableAllMotors();
++Car_Mode = Run_Mode;
++
++    gimbal_disable_all();
+     MaixCam_LaserOff();
+ }
+ 
+ /**
+  * @brief  判断 MaixCam 靶心坐标是否新鲜且处于 640x480 图像范围内。
+  */
+-#if 0 /* Replaced by the unified pixel-rate-current controller below. */
+-uint8_t Vision_Control_IsTargetValid(void)
+-{
+-    uint32_t now = HAL_GetTick();
+-
+-    if (maixcam_frame_count == 0U) return 0U;
+-    if ((now - maixcam_last_rx_tick) > VISION_TARGET_TIMEOUT_MS) return 0U;
+-    if ((maixcam_target_x >= 320U) || (maixcam_target_y >= 240U)) return 0U;
+-    if ((maixcam_laser_x >= 320U) || (maixcam_laser_y >= 240U)) return 0U;
+-    if ((maixcam_laser_x == 0U) && (maixcam_laser_y == 0U)) return 0U;
+-    return 1U;
+-}
+-
+-/**
+- * @brief  清除 X 轴滤波、PID 和速度斜坡状态。
+- */
+-static void Vision_X_StateClear(void)
+-{
+-    Vision_X_Filter_Ready = 0U;
+-    Vision_X_Last_Frame_Count = 0U;
+-    Vision_X_Target_Filtered = 0.0f;
+-    Vision_X_Laser_Filtered = 0.0f;
+-    Vision_X_Last_Current = 0.0f;
+-    PID_Clear_State(&pid_dr4310X);
+-}
+-
+-/**
+- * @brief  按 MaixCam 新帧更新 X 轴目标和激光坐标低通滤波值。
+- */
+-static void Vision_X_FilterUpdate(void)
+-{
+-    float target_x = (float)maixcam_target_x;
+-    float laser_x = (float)maixcam_laser_x;
+-
+-    if (Vision_X_Filter_Ready == 0U)
+-    {
+-        Vision_X_Target_Filtered = target_x;
+-        Vision_X_Laser_Filtered = laser_x;
+-        Vision_X_Last_Frame_Count = maixcam_frame_count;
+-        Vision_X_Filter_Ready = 1U;
+-        return;
+-    }
+-
+-    if (Vision_X_Last_Frame_Count == maixcam_frame_count) return;
+-
+-    Vision_X_Last_Frame_Count = maixcam_frame_count;
+-    Vision_X_Target_Filtered += VISION_X_FILTER_ALPHA *
+-                                (target_x - Vision_X_Target_Filtered);
+-    Vision_X_Laser_Filtered += VISION_X_FILTER_ALPHA *
+-                               (laser_x - Vision_X_Laser_Filtered);
+-}
+-
+-/**
+- * @brief  限制X轴电流及相邻控制周期的电流变化量。
+- */
+-static float Vision_X_CurrentLimit(float current)
+-{
+-    float current_change;
+-
+-    current = Limit_Float(current,
+-                          -VISION_X_CURRENT_LIMIT_A,
+-                          VISION_X_CURRENT_LIMIT_A);
+-    current_change = Limit_Float(current - Vision_X_Last_Current,
+-                                 -VISION_X_CURRENT_STEP_A,
+-                                 VISION_X_CURRENT_STEP_A);
+-    Vision_X_Last_Current += current_change;
+-    return Vision_X_Last_Current;
+-}
+-
+-static void Vision_PID_Clear(void)
+-{
+-    Vision_X_StateClear();
+-    PID_Clear_State(&pid_dr4310Y);
+-}
+-
+-/**
+- * @brief  视觉坐标外环 PID，输出单位为 RPM。
+- * @note   这里的 Kp/Ki/Kd 是“像素误差到 RPM”的参数，不是 QD4310 内部速度环参数。
+- */
+-#if 0
+-static float Vision_PID_Calc(Vision_PID_State_t *pid, float error,
+-                             float kp, float ki, float kd)
+-{
+-    float integral_next;
+-    float output;
+-
+-    if (fabsf(error) <= VISION_DEADBAND_PX)
+-    {
+-        pid->integral = 0.0f;
+-        pid->error_last = error;
+-        return 0.0f;
+-    }
+-
+-    integral_next = Limit_Float(pid->integral + error,
+-                                -VISION_INTEGRAL_LIMIT_PX,
+-                                VISION_INTEGRAL_LIMIT_PX);
+-    output = kp * error + ki * integral_next + kd * (error - pid->error_last);
+-    output = Vision_LimitSpeed(output);
+-
+-    /* 输出饱和且误差仍推动同方向时，暂不继续累加积分。 */
+-    if (!(((output >= VISION_SPEED_LIMIT_RPM) && (error > 0.0f)) ||
+-          ((output <= -VISION_SPEED_LIMIT_RPM) && (error < 0.0f))))
+-    {
+-        pid->integral = integral_next;
+-    }
+-    pid->error_last = error;
+-    return output;
+-}
+-#endif
+-
+-static void Vision_SetOutput(float x_current, float y_speed)
+-{
+-    if (Vision_X_Motor_Enabled != 0U)
+-    {
+-        QD4310_SetCurrent(&Vision_Motor_X, x_current);
+-    }
+-    if (Vision_Y_Motor_Enabled != 0U)
+-    {
+-        QD4310_SetLowSpeed(&Vision_Motor_Y, y_speed);
+-    }
+-}
+-
+-/**
+- * @brief  启动视觉瞄准：靶心有效时开始坐标控制。
+- *         电机使能由 B2（X 轴）和 B3（Y 轴）单独控制。
+- */
+-void Vision_Control_Start(void)
+-{
+-    if (Vision_Control_IsTargetValid() == 0U)
+-    {
+-        Vision_Target_Lost = 1U;
+-        return;
+-    }
+-
+-    Vision_Target_Lost = 0U;
+-    Vision_Control_Active = 1U;
+-    Vision_Last_Control_Tick = 0U;
+-    Vision_PID_Clear();
+-}
+-
+-/**
+- * @brief  确保双轴使能后启动视觉闭环。
+- * @note   已使能的电机保持使能，不会因重复调用而被关闭。
+- */
+-void Vision_Control_StartBothMotors(void)
+-{
+-    if (Vision_X_Motor_Enabled == 0U)
+-    {
+-        QD4310_Enable(&Vision_Motor_X);
+-        QD4310_SetCurrent(&Vision_Motor_X, 0.0f);
+-        Vision_X_Motor_Enabled = 1U;
+-    }
+-
+-    if (Vision_Y_Motor_Enabled == 0U)
+-    {
+-        QD4310_Enable(&Vision_Motor_Y);
+-        QD4310_SetLowSpeed(&Vision_Motor_Y, 0.0f);
+-        Vision_Y_Motor_Enabled = 1U;
+-    }
+-
+-    Vision_Both_Start_Request = 1U;
+-    if (Vision_Control_IsTargetValid() != 0U)
+-    {
+-        Vision_Control_Start();
+-        Vision_Both_Start_Request = 0U;
+-    }
+-    else
+-    {
+-        Vision_Target_Lost = 1U;
+-    }
+-}
+-
+-/**
+- * @brief  停止视觉瞄准：已使能双轴归零速度。
+- *         不改变电机使能和激光状态。
+- */
+-void Vision_Control_Stop(void)
+-{
+-    Vision_Control_Active = 0U;
+-    Vision_Target_Lost = 0U;
+-    Vision_Both_Start_Request = 0U;
+-    Vision_Last_Control_Tick = 0U;
+-    Vision_PID_Clear();
+-
+-    if ((Vision_X_Motor_Enabled != 0U) || (Vision_Y_Motor_Enabled != 0U))
+-    {
+-        Vision_SetOutput(0.0f, 0.0f);
+-    }
+-}
+-
+-/**
+- * @brief  切换 B5 瞄准开关。目标丢失后再次按下用于重新启动。
+- */
+-void Vision_Control_Toggle(void)
+-{
+-    if (Vision_Control_Active != 0U)
+-    {
+-        Vision_Control_Stop();
+-    }
+-    else
+-    {
+-        Vision_Control_Start();
+-    }
+-}
+-
+-/**
+- * @brief  B2 云台测试开关：单独使能或失能 X 轴，不开启激光和视觉闭环。
+- */
+-void Vision_Control_ToggleXMotor(void)
+-{
+-    if (Vision_X_Motor_Enabled != 0U)
+-    {
+-        QD4310_SetCurrent(&Vision_Motor_X, 0.0f);
+-        QD4310_Disable(&Vision_Motor_X);
+-        Vision_X_Motor_Enabled = 0U;
+-        Vision_Both_Start_Request = 0U;
+-        Vision_X_StateClear();
+-    }
+-    else
+-    {
+-        QD4310_Enable(&Vision_Motor_X);
+-        QD4310_SetCurrent(&Vision_Motor_X, 0.0f);
+-        Vision_X_Motor_Enabled = 1U;
+-        Vision_X_StateClear();
+-        Vision_Last_Control_Tick = 0U;
+-
+-        if (Vision_Control_IsTargetValid() != 0U)
+-        {
+-            Vision_Target_Lost = 0U;
+-            Vision_Control_Active = 1U;
+-        }
+-        else
+-        {
+-            Vision_Target_Lost = 1U;
+-        }
+-    }
+-
+-    if ((Vision_X_Motor_Enabled == 0U) && (Vision_Y_Motor_Enabled == 0U))
+-    {
+-        Vision_Control_Active = 0U;
+-        Vision_Last_Control_Tick = 0U;
+-    }
+-}
+-
+-/**
+- * @brief  B3 云台测试开关：单独使能或失能 Y 轴，不开启激光和视觉闭环。
+- */
+-void Vision_Control_ToggleYMotor(void)
+-{
+-    if (Vision_Y_Motor_Enabled != 0U)
+-    {
+-        QD4310_SetLowSpeed(&Vision_Motor_Y, 0.0f);
+-        QD4310_Disable(&Vision_Motor_Y);
+-        Vision_Y_Motor_Enabled = 0U;
+-        Vision_Both_Start_Request = 0U;
+-        PID_Clear_State(&pid_dr4310Y);
+-    }
+-    else
+-    {
+-        QD4310_Enable(&Vision_Motor_Y);
+-        Vision_Y_Motor_Enabled = 1U;
+-        PID_Clear_State(&pid_dr4310Y);
+-        Vision_Last_Control_Tick = 0U;
+-
+-        if (Vision_Control_IsTargetValid() != 0U)
+-        {
+-            Vision_Target_Lost = 0U;
+-            Vision_Control_Active = 1U;
+-        }
+-        else
+-        {
+-            Vision_Target_Lost = 1U;
+-        }
+-    }
+-
+-    if ((Vision_X_Motor_Enabled == 0U) && (Vision_Y_Motor_Enabled == 0U))
+-    {
+-        Vision_Control_Active = 0U;
+-        Vision_Both_Start_Request = 0U;
+-        Vision_Last_Control_Tick = 0U;
+-    }
+-}
+-
+-/**
+- * @brief  主循环调用的 MaixCam 坐标外环，固定周期发送双轴速度命令。
+- * @note   QD4310 驱动含同步反馈等待，禁止在定时器中断中调用。
+- */
+-void Vision_Control_Task(void)
+-{
+-    float x_actual;
+-    float y_actual;
+-    float x_current;
+-    float y_speed;
+-    uint32_t now;
+-
+-    if (Vision_Control_Active == 0U)
+-    {
+-        if ((Vision_Both_Start_Request != 0U) &&
+-            (Vision_Control_IsTargetValid() != 0U))
+-        {
+-            Vision_Control_Start();
+-            Vision_Both_Start_Request = 0U;
+-        }
+-        return;
+-    }
+-
+-    now = HAL_GetTick();
+-    if ((now - Vision_Last_Control_Tick) < VISION_CONTROL_PERIOD_MS) return;
+-    Vision_Last_Control_Tick = now;
+-
+-    if (Vision_Control_IsTargetValid() == 0U)
+-    {
+-        Vision_SetOutput(0.0f, 0.0f);
+-        Vision_Control_Active = 0U;
+-        Vision_Target_Lost = 1U;
+-        Vision_PID_Clear();
+-        return;
+-    }
+-
+-    x_current = 0.0f;
+-    y_speed = 0.0f;
+-
+-    if (Vision_X_Motor_Enabled != 0U)
+-    {
+-        Vision_X_FilterUpdate();
+-        set_pid_target(&pid_dr4310X, Vision_X_Target_Filtered);
+-        x_actual = Vision_X_Laser_Filtered;
+-        x_current = dr4310_pid_realize(&pid_dr4310X,
+-                                       x_actual,
+-                                       VISION_X_CURRENT_LIMIT_A);
+-        x_current = Vision_X_CurrentLimit(x_current * VISION_X_DIRECTION);
+-    }
+-    else
+-    {
+-        Vision_X_StateClear();
+-    }
+-
+-    if (Vision_Y_Motor_Enabled != 0U)
+-    {
+-        set_pid_target(&pid_dr4310Y, (float)maixcam_target_y);
+-        y_actual = (float)maixcam_laser_y;
+-        y_speed = dr4310_pid_realize(&pid_dr4310Y,
+-                                     y_actual,
+-                                     VISION_Y_SPEED_LIMIT_RPM) * VISION_Y_DIRECTION;
+-    }
+-    else
+-    {
+-        PID_Clear_State(&pid_dr4310Y);
+-    }
+-    Vision_SetOutput(x_current, y_speed);
+-}
+-
+-uint8_t Vision_Control_IsActive(void)
+-{
+-    return Vision_Control_Active;
+-}
+-
+-const char *Vision_Control_GetStateText(void)
+-{
+-    if (Vision_Control_Active != 0U) return "RUN";
+-    if (Vision_Target_Lost != 0U) return "LOST";
+-    if ((Vision_X_Motor_Enabled != 0U) || (Vision_Y_Motor_Enabled != 0U)) return "WAIT";
+-    return "OFF";
+-}
+-
+-float Vision_Control_GetXSpeed(void)
+-{
+-    return Vision_Motor_X.speed;
+-}
+-
+-float Vision_Control_GetYSpeed(void)
+-{
+-    return Vision_Motor_Y.speed;
+-}
+-
+-#endif
+-
+-#if 0 /* Replaced by the 200 Hz external dual-axis cascade below. */
+-typedef enum { VISION_AXIS_X = 0U, VISION_AXIS_Y, VISION_AXIS_COUNT } Vision_Axis_Index_t;
+-typedef struct
+-{
+-    QD4310_t *motor;
+-    _pid *pixel_pid;
+-    uint8_t *enabled;
+-    float pixel_actual_filtered;
+-    float target_speed_rpm;
+-    float last_speed_command_rpm;
+-    uint32_t last_vision_frame_count;
+-    uint8_t filter_ready;
+-} Vision_Axis_t;
+-
+-static Vision_Axis_t Vision_Axes[VISION_AXIS_COUNT] =
+-{
+-    {&Vision_Motor_X, &pid_dr4310X, &Vision_X_Motor_Enabled,
+-     0.0f, 0.0f, 0.0f, 0U, 0U},
+-    {&Vision_Motor_Y, &pid_dr4310Y, &Vision_Y_Motor_Enabled,
+-     0.0f, 0.0f, 0.0f, 0U, 0U}
+-};
+-
+-static void Vision_AllAxesClear(void);
+-static void Vision_AxisStopOutput(Vision_Axis_t *axis);
+-
+-static uint8_t Vision_FrameFresh(void)
+-{
+-    uint32_t now = HAL_GetTick();
+-
+-    if (maixcam_frame_count == 0U) return 0U;
+-    if ((now - maixcam_last_rx_tick) > VISION_TARGET_TIMEOUT_MS) return 0U;
+-    return 1U;
+-}
+-
+-static uint8_t Vision_XImuFresh(void)
+-{
+-    uint32_t now = HAL_GetTick();
+-
+-    if (maixcam_imu_frame_count == 0U) return 0U;
+-    if ((maixcam_imu_flags & MAIXCAM_IMU_FLAG_VALID) == 0U) return 0U;
+-    return ((now - maixcam_last_imu_tick) <= VISION_X_IMU_TIMEOUT_MS) ? 1U : 0U;
+-}
+-
+-static float Vision_XGyroDps(void)
+-{
+-    return VISION_X_GYRO_SIGN * maixcam_gyro_z_dps;
+-}
+-
+-static uint8_t Vision_CoordinatesValid(void)
+-{
+-    uint8_t required_flags = MAIXCAM_FLAG_TARGET | MAIXCAM_FLAG_MAPPING |
+-                             MAIXCAM_FLAG_AIM;
+-
+-    if (Vision_FrameFresh() == 0U) return 0U;
+-    if ((maixcam_vision_flags & required_flags) != required_flags) return 0U;
+-    if ((maixcam_center_x == 0U) && (maixcam_center_y == 0U)) return 0U;
+-
+-    return ((maixcam_center_x < VISION_IMAGE_WIDTH_PX) &&
+-            (maixcam_center_y < VISION_IMAGE_HEIGHT_PX)) ? 1U : 0U;
+-}
+-
+-static uint8_t Vision_YSearchNeeded(void)
+-{
+-    if (Vision_Y_Search_Armed == 0U) return 0U;
+-    if (Vision_Y_Motor_Enabled == 0U) return 0U;
+-    if (Vision_FrameFresh() == 0U) return 0U;
+-
+-    return ((maixcam_center_x == 0U) && (maixcam_center_y == 0U)) ? 1U : 0U;
+-}
+-
+-static void Vision_YSearchReset(void)
+-{
+-    Vision_Y_Search_Active = 0U;
+-    Vision_Y_Search_Last_Tick = 0U;
+-}
+-
+-static void Vision_YSearchLowSpeed(uint32_t now)
+-{
+-    if (Vision_Y_Search_Active == 0U)
+-    {
+-        /* Searching is only a Y-axis motion; remove stale pixel PID output. */
+-        Vision_AxisStopOutput(&Vision_Axes[VISION_AXIS_X]);
+-        Vision_AxisStopOutput(&Vision_Axes[VISION_AXIS_Y]);
+-        Vision_AllAxesClear();
+-        Vision_Control_Active = 0U;
+-        Vision_Both_Start_Request = 1U;
+-        Vision_Target_Lost = 1U;
+-        Vision_Y_Search_Active = 1U;
+-        Vision_Y_Search_Last_Tick = 0U;
+-    }
+-
+-    if ((now - Vision_Y_Search_Last_Tick) >= VISION_Y_SEARCH_COMMAND_PERIOD_MS)
+-    {
+-        QD4310_SetLowSpeed(&Vision_Motor_Y,
+-                            VISION_Y_SPEED_SIGN * VISION_Y_SEARCH_SPEED_RPM);
+-        Vision_Y_Search_Last_Tick = now;
+-    }
+-}
+-
+-uint8_t Vision_Control_IsTargetValid(void)
+-{
+-    return Vision_CoordinatesValid();
+-}
+-
+-static float Vision_AxisPixelActual(Vision_Axis_Index_t index)
+-{
+-    return (index == VISION_AXIS_X) ? (float)maixcam_center_x :
+-                                       (float)maixcam_center_y;
+-}
+-
+-static float Vision_AxisPixelTarget(Vision_Axis_Index_t index)
+-{
+-    if ((Car_Mode == X_Mode) && (index == VISION_AXIS_X))
+-        return Vision_Pixel_Debug_Target[VISION_AXIS_X];
+-    if ((Car_Mode == Y_Mode) && (index == VISION_AXIS_Y))
+-        return Vision_Pixel_Debug_Target[VISION_AXIS_Y];
+-    return (index == VISION_AXIS_X) ? VISION_IMAGE_CENTER_X_PX :
+-                                      VISION_IMAGE_CENTER_Y_PX;
+-}
+-
+-static void Vision_AxisClear(Vision_Axis_t *axis)
+-{
+-    axis->pixel_actual_filtered = 0.0f;
+-    axis->target_speed_rpm = 0.0f;
+-    axis->last_speed_command_rpm = 0.0f;
+-    axis->last_vision_frame_count = 0U;
+-    axis->filter_ready = 0U;
+-    PID_Clear_State(axis->pixel_pid);
+-    if (axis == &Vision_Axes[VISION_AXIS_X]) PID_Clear_State(&pid_dr4310X_rate);
+-}
+-
+-static void Vision_AllAxesClear(void)
+-{
+-    uint8_t index;
+-    for (index = 0U; index < VISION_AXIS_COUNT; index++) Vision_AxisClear(&Vision_Axes[index]);
+-}
+-
+-static void Vision_AxisStopOutput(Vision_Axis_t *axis)
+-{
+-    axis->target_speed_rpm = 0.0f;
+-    axis->last_speed_command_rpm = 0.0f;
+-    if (axis == &Vision_Axes[VISION_AXIS_X])
+-    {
+-        PID_Clear_State(&pid_dr4310X_rate);
+-        QD4310_SetCurrent(axis->motor, 0.0f);
+-    }
+-    else
+-        QD4310_SetLowSpeed(axis->motor, 0.0f);
+-}
+-
+-/* X uses QD4310 current mode for the heavy load; Y remains QD low-speed mode. */
+-static void Vision_AxisSendCommand(Vision_Axis_t *axis, float command)
+-{
+-    if (*(axis->enabled) == 0U) return;
+-    if (axis == &Vision_Axes[VISION_AXIS_Y])
+-    {
+-        command = Limit_Float(command, -VISION_QD_SPEED_LIMIT_RPM, VISION_QD_SPEED_LIMIT_RPM);
+-        axis->last_speed_command_rpm = command;
+-        QD4310_SetLowSpeed(axis->motor, VISION_Y_SPEED_SIGN * command);
+-    }
+-}
+-
+-/* X: pixel PID -> target rate(deg/s), WT61 GZ -> rate PID -> current(A). */
+-static void Vision_XRateInnerStep(float target_rate_dps)
+-{
+-    Vision_Axis_t *axis = &Vision_Axes[VISION_AXIS_X];
+-    float current_command;
+-    float current_change;
+-
+-    if (Vision_X_Motor_Enabled == 0U) return;
+-    if (Vision_XImuFresh() == 0U)
+-    {
+-        Vision_AxisStopOutput(axis);
+-        return;
+-    }
+-
+-    target_rate_dps = Limit_Float(target_rate_dps,
+-                                  -VISION_X_RATE_LIMIT_DPS,
+-                                  VISION_X_RATE_LIMIT_DPS);
+-    set_pid_target(&pid_dr4310X_rate, target_rate_dps);
+-    current_command = pid_realize_limited(&pid_dr4310X_rate,
+-                                          Vision_XGyroDps(),
+-                                          VISION_X_CURRENT_LIMIT_A,
+-                                          VISION_X_RATE_INTEGRAL_LIMIT,
+-                                          VISION_X_RATE_DEADBAND_DPS);
+-
+-    current_change = Limit_Float(current_command - axis->last_speed_command_rpm,
+-                                 -VISION_X_CURRENT_RAMP_A_PER_10MS,
+-                                 VISION_X_CURRENT_RAMP_A_PER_10MS);
+-    axis->last_speed_command_rpm += current_change;
+-    axis->last_speed_command_rpm = Limit_Float(axis->last_speed_command_rpm,
+-                                                -VISION_X_CURRENT_LIMIT_A,
+-                                                VISION_X_CURRENT_LIMIT_A);
+-    QD4310_SetCurrent(axis->motor,
+-                      VISION_X_CURRENT_SIGN * axis->last_speed_command_rpm);
+-}
+-
+-static void Vision_AxisOuterStep(Vision_Axis_Index_t index)
+-{
+-    Vision_Axis_t *axis = &Vision_Axes[index];
+-    float target;
+-    float actual;
+-    float command;
+-    float output_limit;
+-
+-    if (*(axis->enabled) == 0U) return;
+-    if (axis->last_vision_frame_count == maixcam_frame_count) return;
+-    axis->last_vision_frame_count = maixcam_frame_count;
+-
+-    target = Vision_AxisPixelTarget(index);
+-    actual = Vision_AxisPixelActual(index);
+-    if (axis->filter_ready == 0U)
+-    {
+-        axis->pixel_actual_filtered = actual;
+-        axis->filter_ready = 1U;
+-    }
+-    else
+-    {
+-        axis->pixel_actual_filtered += VISION_FILTER_ALPHA *
+-                                       (actual - axis->pixel_actual_filtered);
+-    }
+-    /* X PID output is target rate(deg/s); Y PID output is low-speed reference(rpm). */
+-    set_pid_target(axis->pixel_pid, target);
+-    output_limit = (index == VISION_AXIS_X) ? VISION_X_RATE_LIMIT_DPS :
+-                                               VISION_QD_SPEED_LIMIT_RPM;
+-    command = pid_realize_limited(axis->pixel_pid, axis->pixel_actual_filtered,
+-                                  output_limit, VISION_PIXEL_INTEGRAL_LIMIT,
+-                                  VISION_PIXEL_DEADBAND_PX);
+-    axis->target_speed_rpm = command;
+-}
+-
+-static void Vision_AxisEnable(Vision_Axis_Index_t index)
+-{
+-    Vision_Axis_t *axis = &Vision_Axes[index];
+-    if (*(axis->enabled) == 0U)
+-    {
+-        QD4310_Enable(axis->motor);
+-        *(axis->enabled) = 1U;
+-    }
+-    Vision_AxisClear(axis);
+-    Vision_AxisStopOutput(axis);
+-}
+-
+-static void Vision_AxisDisable(Vision_Axis_Index_t index)
+-{
+-    Vision_Axis_t *axis = &Vision_Axes[index];
+-    if (*(axis->enabled) != 0U)
+-    {
+-        Vision_AxisStopOutput(axis);
+-        QD4310_Disable(axis->motor);
+-        *(axis->enabled) = 0U;
+-    }
+-    Vision_AxisClear(axis);
+-}
+-
+-void Vision_Control_SetTaskMode(uint8_t mode)
+-{
+-    (void)mode;
+-    Vision_Selected_Task_Mode = 1U;
+-}
+-
+-void Vision_Control_NextTaskMode(void)
+-{
+-    /* Fixed-centre protocol: K4 task switching is intentionally disabled. */
+-}
+-
+-uint8_t Vision_Control_GetTaskMode(void)
+-{
+-    return Vision_Selected_Task_Mode;
+-}
+-
+-static void Vision_Control_ActivateCameraMode(void)
+-{
+-    /* MaixCAM2 continuously sends the fixed-centre visual feedback. */
+-}
+-
+-static void Vision_Control_UpdateCameraLink(void)
+-{
+-    /* No STM32 -> MaixCAM2 visual task traffic in the fixed-centre protocol. */
+-}
+-
+-void Vision_Control_Start(void)
+-{
+-    if (Vision_Control_IsTargetValid() == 0U)
+-    {
+-        Vision_Target_Lost = 1U;
+-        Vision_Both_Start_Request = 1U;
+-        return;
+-    }
+-    Vision_Rate_Debug_Active = 0U;
+-    Vision_Target_Lost = 0U;
+-    Vision_Both_Start_Request = 0U;
+-    Vision_Control_Active = 1U;
+-    Vision_Last_Outer_Tick = 0U;
+-    Vision_Last_Inner_Tick = 0U;
+-    Vision_AllAxesClear();
+-}
+-
+-void Vision_Control_StartBothMotors(void)
+-{
+-    Vision_AxisEnable(VISION_AXIS_X);
+-    Vision_AxisEnable(VISION_AXIS_Y);
+-    Vision_Control_ActivateCameraMode();
+-    Vision_Y_Search_Armed = 1U;
+-    Vision_YSearchReset();
+-    Vision_Both_Start_Request = 1U;
+-    if (Vision_Control_IsTargetValid() != 0U)
+-    {
+-        Vision_Control_Start();
+-        Vision_Both_Start_Request = 0U;
+-    }
+-    else Vision_Target_Lost = 1U;
+-}
+-
+-/* Start one visual closed-loop axis without disabling the other axis. */
+-void Vision_Control_StartAxisVisual(uint8_t axis)
+-{
+-    if (axis >= VISION_AXIS_COUNT) return;
+-
+-    Vision_Rate_Debug_Active = 0U;
+-    Vision_AxisEnable((Vision_Axis_Index_t)axis);
+-    Vision_Both_Start_Request = 1U;
+-
+-    if (Vision_Control_IsTargetValid() != 0U)
+-    {
+-        Vision_Control_Start();
+-        Vision_Both_Start_Request = 0U;
+-    }
+-    else
+-    {
+-        Vision_Target_Lost = 1U;
+-    }
+-}
+-
+-void Vision_Control_StartPixelDebug(uint8_t axis)
+-{
+-    if (axis >= VISION_AXIS_COUNT) return;
+-
+-    Vision_Control_Stop();
+-    Vision_AxisDisable(VISION_AXIS_X);
+-    Vision_AxisDisable(VISION_AXIS_Y);
+-    Vision_AxisEnable((Vision_Axis_Index_t)axis);
+-    Vision_Control_ActivateCameraMode();
+-    Vision_Both_Start_Request = 1U;
+-    Vision_Control_Start();
+-}
+-
+-void Vision_Control_Stop(void)
+-{
+-    uint8_t index;
+-    Vision_Control_Active = 0U;
+-    Vision_Rate_Debug_Active = 0U;
+-    Vision_Target_Lost = 0U;
+-    Vision_Both_Start_Request = 0U;
+-    Vision_Y_Search_Armed = 0U;
+-    Vision_YSearchReset();
+-    Vision_Last_Outer_Tick = 0U;
+-    Vision_Last_Inner_Tick = 0U;
+-    for (index = 0U; index < VISION_AXIS_COUNT; index++)
+-        if (*(Vision_Axes[index].enabled) != 0U) Vision_AxisStopOutput(&Vision_Axes[index]);
+-    Vision_AllAxesClear();
+-}
+-
+-void Vision_Control_Toggle(void)
+-{
+-    if (Vision_Control_Active != 0U) Vision_Control_Stop();
+-    else Vision_Control_Start();
+-}
+-
+-void Vision_Control_ToggleXMotor(void)
+-{
+-    if (Vision_X_Motor_Enabled != 0U) Vision_AxisDisable(VISION_AXIS_X);
+-    else Vision_AxisEnable(VISION_AXIS_X);
+-    if ((Vision_X_Motor_Enabled == 0U) && (Vision_Y_Motor_Enabled == 0U)) Vision_Control_Stop();
+-}
+-
+-void Vision_Control_ToggleYMotor(void)
+-{
+-    if (Vision_Y_Motor_Enabled != 0U) Vision_AxisDisable(VISION_AXIS_Y);
+-    else Vision_AxisEnable(VISION_AXIS_Y);
+-    if ((Vision_X_Motor_Enabled == 0U) && (Vision_Y_Motor_Enabled == 0U)) Vision_Control_Stop();
+-}
+-
+-void Vision_Control_StartRateDebug(uint8_t axis)
+-{
+-    Vision_Control_Stop();
+-    Vision_AxisDisable(VISION_AXIS_X);
+-    Vision_AxisDisable(VISION_AXIS_Y);
+-    if (axis != VISION_AXIS_X) return;
+-
+-    Vision_AxisEnable(VISION_AXIS_X);
+-    Vision_Rate_Debug_Active = 1U;
+-    Vision_Target_Lost = 0U;
+-    Vision_Last_Inner_Tick = 0U;
+-}
+-
+-void Vision_Control_ArmRateDebug(uint8_t axis)
+-{
+-    Vision_Control_StartRateDebug(axis);
+-}
+-
+-void Vision_Control_DisableAllMotors(void)
+-{
+-    Vision_Control_Stop();
+-    Vision_AxisDisable(VISION_AXIS_X);
+-    Vision_AxisDisable(VISION_AXIS_Y);
+-}
+-
+-void Vision_Control_SetRateDebugTarget(float target_dps)
+-{
+-    Vision_Rate_Debug_Target_Dps = Limit_Float(target_dps,
+-                                                -VISION_X_RATE_LIMIT_DPS,
+-                                                VISION_X_RATE_LIMIT_DPS);
+-    if ((Car_Mode == X_Rate_Mode) && (Vision_Rate_Debug_Active == 0U))
+-        Vision_Control_StartRateDebug(VISION_AXIS_X);
+-}
+-
+-void Vision_Control_SetPixelDebugTarget(uint8_t axis, float target_px)
+-{
+-    if (axis >= VISION_AXIS_COUNT) return;
+-    if (axis == VISION_AXIS_X)
+-        Vision_Pixel_Debug_Target[axis] = Limit_Float(target_px, 0.0f,
+-                                                      (float)(VISION_IMAGE_WIDTH_PX - 1U));
+-    else
+-        Vision_Pixel_Debug_Target[axis] = Limit_Float(target_px, 0.0f,
+-                                                      (float)(VISION_IMAGE_HEIGHT_PX - 1U));
+-}
+-
+-void Vision_Control_Task(void)
+-{
+-    uint32_t now = HAL_GetTick();
+-    uint8_t index;
+-
+-    Vision_Control_UpdateCameraLink();
+-
+-    /* X-rate tuning does not require a vision target, only fresh WT61 data. */
+-    if (Vision_Rate_Debug_Active != 0U)
+-    {
+-        if ((now - Vision_Last_Inner_Tick) >= VISION_INNER_PERIOD_MS)
+-        {
+-            Vision_Last_Inner_Tick = now;
+-            Vision_XRateInnerStep(Vision_Rate_Debug_Target_Dps);
+-        }
+-        return;
+-    }
+-
+-    /* A missing serial stream is a safety fault, never a reason to scan. */
+-    if (Vision_FrameFresh() == 0U)
+-    {
+-        if ((Vision_X_Motor_Enabled != 0U) || (Vision_Y_Motor_Enabled != 0U))
+-        {
+-            Vision_AxisStopOutput(&Vision_Axes[VISION_AXIS_X]);
+-            Vision_AxisStopOutput(&Vision_Axes[VISION_AXIS_Y]);
+-            Vision_AllAxesClear();
+-        }
+-        Vision_YSearchReset();
+-        Vision_Target_Lost = 1U;
+-        return;
+-    }
+-
+-    if (Vision_YSearchNeeded() != 0U)
+-    {
+-        Vision_YSearchLowSpeed(now);
+-        return;
+-    }
+-
+-    if (Vision_Y_Search_Active != 0U)
+-    {
+-        Vision_YSearchReset();
+-        Vision_Target_Lost = 0U;
+-    }
+-
+-    if (Vision_Control_Active == 0U)
+-    {
+-        if ((Vision_Both_Start_Request != 0U) && (Vision_Control_IsTargetValid() != 0U))
+-        {
+-            Vision_Control_Start();
+-            Vision_Both_Start_Request = 0U;
+-        }
+-        return;
+-    }
+-    if (Vision_Control_IsTargetValid() == 0U)
+-    {
+-        /*
+-         * A lost/invalid vision frame is a temporary measurement fault.
+-         * Stop motor outputs while preserving the requested visual loop and
+-         * independent K1 laser state.  A temporary bad frame must not toggle
+-         * the laser command or require MaixCAM2 task reinitialisation.
+-         */
+-        if (Vision_Target_Lost == 0U)
+-        {
+-            for (index = 0U; index < VISION_AXIS_COUNT; index++)
+-            {
+-                if (*(Vision_Axes[index].enabled) != 0U)
+-                    Vision_AxisStopOutput(&Vision_Axes[index]);
+-            }
+-            Vision_AllAxesClear();
+-        }
+-        Vision_Target_Lost = 1U;
+-        return;
+-    }
+-    if ((now - Vision_Last_Outer_Tick) >= VISION_OUTER_PERIOD_MS)
+-    {
+-        Vision_Last_Outer_Tick = now;
+-        for (index = 0U; index < VISION_AXIS_COUNT; index++) Vision_AxisOuterStep((Vision_Axis_Index_t)index);
+-    }
+-    if ((now - Vision_Last_Inner_Tick) >= VISION_INNER_PERIOD_MS)
+-    {
+-        Vision_Last_Inner_Tick = now;
+-        Vision_XRateInnerStep(Vision_Axes[VISION_AXIS_X].target_speed_rpm);
+-        Vision_AxisSendCommand(&Vision_Axes[VISION_AXIS_Y],
+-                               Vision_Axes[VISION_AXIS_Y].target_speed_rpm);
+-    }
+-}
+-
+-uint8_t Vision_Control_IsActive(void) { return Vision_Control_Active; }
+-const char *Vision_Control_GetStateText(void)
+-{
+-    if (Vision_Rate_Debug_Active != 0U) return "RATE";
+-    if (Vision_Target_Lost != 0U) return "LOST";
+-    if (Vision_Control_Active != 0U) return "RUN";
+-    return ((Vision_X_Motor_Enabled != 0U) || (Vision_Y_Motor_Enabled != 0U)) ? "WAIT" : "OFF";
+-}
+-float Vision_Control_GetXSpeed(void) { return Vision_Motor_X.speed; }
+-float Vision_Control_GetYSpeed(void) { return Vision_Motor_Y.speed; }
+-float Vision_Control_GetXRate(void) { return (Vision_XImuFresh() != 0U) ? Vision_XGyroDps() : 0.0f; }
+-float Vision_Control_GetYRate(void) { return Vision_Axes[VISION_AXIS_Y].target_speed_rpm; }
+-float Vision_Control_GetXCurrent(void) { return Vision_Motor_X.current; }
+-float Vision_Control_GetYCurrent(void) { return Vision_Motor_Y.current; }
+-float Vision_Control_GetXCurrentCommand(void) { return Vision_Axes[VISION_AXIS_X].last_speed_command_rpm; }
+-float Vision_Control_GetXSpeedCommand(void) { return Vision_Axes[VISION_AXIS_X].target_speed_rpm; }
+-float Vision_Control_GetYSpeedCommand(void) { return Vision_Axes[VISION_AXIS_Y].last_speed_command_rpm; }
+-float Vision_Control_GetXPixelActual(void) { return Vision_AxisPixelActual(VISION_AXIS_X); }
+-float Vision_Control_GetYPixelActual(void) { return Vision_AxisPixelActual(VISION_AXIS_Y); }
+-float Vision_Control_GetXPixelTarget(void)
+-{
+-    return (Car_Mode == X_Mode) ? Vision_Pixel_Debug_Target[VISION_AXIS_X] :
+-                                  VISION_IMAGE_CENTER_X_PX;
+-}
+-float Vision_Control_GetYPixelTarget(void)
+-{
+-    return (Car_Mode == Y_Mode) ? Vision_Pixel_Debug_Target[VISION_AXIS_Y] :
+-                                  VISION_IMAGE_CENTER_Y_PX;
+-}
+-uint8_t Vision_Control_IsXMotorEnabled(void) { return Vision_X_Motor_Enabled; }
+-uint8_t Vision_Control_IsYMotorEnabled(void) { return Vision_Y_Motor_Enabled; }
+-uint8_t Vision_Control_IsRateDebugActive(void) { return Vision_Rate_Debug_Active; }
+-
+-#endif
+-
+ /* Dual-axis external cascade: pixel -> 0x53 attitude difference speed ->
+    target motor speed -> QD4310 internal speed/current loops. */
+ #define GIMBAL_INNER_PERIOD_MS             5U   // 5毫秒内部周期时间
+-#define GIMBAL_VISION_PERIOD_MS            20U  // 20毫秒视觉周期时间
+ #define GIMBAL_ATTITUDE_TIMEOUT_MS        100U  // 100毫秒姿态超时
+ #define GIMBAL_TARGET_TIMEOUT_MS          200U  // 200毫秒目标超时
+ #define GIMBAL_CONTROL_DT_S                 0.005f  //  5毫秒控制周期时间
+@@ -1597,20 +639,20 @@ uint8_t Vision_Control_IsRateDebugActive(void) { return Vision_Rate_Debug_Active
+ #define GIMBAL_X_PIXEL_SIGN    (1.0f)   //  云台X轴像素符号对应MaixCAM2的偏航轴符号
+ #define GIMBAL_Y_PIXEL_SIGN    (1.0f)   //  云台Y轴像素符号对应MaixCAM2的俯仰轴符号
+ 
+-typedef enum { VISION_AXIS_X = 0U, VISION_AXIS_Y, VISION_AXIS_COUNT } Vision_Axis_Index_t;  //  云台轴索引枚举类型
++typedef enum { GIMBAL_AXIS_X = 0U, GIMBAL_AXIS_Y, GIMBAL_AXIS_COUNT } GimbalAxis;  //  云台轴索引枚举类型
+ typedef enum
+ {
+     GIMBAL_MODE_CURRENT_TEST = 0U,  //  云台模式：电流测试
+     GIMBAL_MODE_IMU_RATE_TEST,  //  云台模式：IMU速率测试
+     GIMBAL_MODE_PIXEL_TRACK //  云台模式：像素跟踪
+-} Gimbal_Mode_t;    
++} GimbalMode;
+ 
+ typedef struct
+ {
+     QD4310_t *motor;    //  云台电机结构体指针
+     _pid *pixel_pid;    //  云台像素PID结构体指针
+     _pid *imu_rate_pid; //  云台IMU速率PID结构体指针
+-    uint8_t *enabled;   //  云台使能标志指针
++    bool *enabled;   //  云台使能标志指针
+     uint8_t attitude_axis;  //  云台姿态轴索引
+     float attitude_sign;    //  云台姿态符号
+     float speed_sign;       //  云台速度符号
+@@ -1628,21 +670,21 @@ typedef struct
+     float pixel_filtered;       //  云台像素滤波值
+     uint8_t pixel_filter_ready; //  云台像素滤波准备标志
+     uint32_t last_vision_count; //  云台上一次视觉计数
+-} Gimbal_Axis_t;    //  云台轴结构体类型
++} GimbalAxisState;    //  云台轴结构体类型
+ 
+-static Gimbal_Axis_t Gimbal_Axes[VISION_AXIS_COUNT] =   //  云台轴结构体数组
++static GimbalAxisState gimbal_axes[GIMBAL_AXIS_COUNT] =   //  云台轴结构体数组
+ {
+-    {&Vision_Motor_X, &pid_dr4310X, &pid_dr4310X_imu_rate,  //  云台X轴结构体初始化
+-     &Vision_X_Motor_Enabled, GIMBAL_X_ATTITUDE_AXIS, GIMBAL_X_ATTITUDE_SIGN,   
++    {&gimbal_motor_x, &pid_dr4310X, &pid_dr4310X_imu_rate,  //  云台X轴结构体初始化
++     &gimbal_x_enabled, GIMBAL_X_ATTITUDE_AXIS, GIMBAL_X_ATTITUDE_SIGN,
+      GIMBAL_X_SPEED_SIGN, GIMBAL_X_PIXEL_SIGN},
+-    {&Vision_Motor_Y, &pid_dr4310Y, &pid_dr4310Y_imu_rate,
+-     &Vision_Y_Motor_Enabled, GIMBAL_Y_ATTITUDE_AXIS, GIMBAL_Y_ATTITUDE_SIGN,
++    {&gimbal_motor_y, &pid_dr4310Y, &pid_dr4310Y_imu_rate,
++     &gimbal_y_enabled, GIMBAL_Y_ATTITUDE_AXIS, GIMBAL_Y_ATTITUDE_SIGN,
+      GIMBAL_Y_SPEED_SIGN, GIMBAL_Y_PIXEL_SIGN}
+ };
+     
+-static Gimbal_Mode_t Gimbal_Mode = GIMBAL_MODE_PIXEL_TRACK; //  云台模式初始化为像素跟踪模式
+-static uint32_t Gimbal_Last_Inner_Tick = 0U;    //  云台上一次内部周期时间戳
+-static uint8_t Gimbal_Serial_Fault = 0U;        //  云台串口故障标志
++static GimbalMode gimbal_mode = GIMBAL_MODE_PIXEL_TRACK; //  云台模式初始化为像素跟踪模式
++static uint32_t gimbal_last_inner_tick_ms = 0U;    //  云台上一次内部周期时间戳
++static bool gimbal_serial_fault = false;        //  云台串口故障标志
+ 
+ typedef enum    //  云台过渡状态枚举类型
+ {
+@@ -1650,16 +692,16 @@ typedef enum    //  云台过渡状态枚举类型
+     GIMBAL_TRANSITION_WAIT_FRESH,   //  云台过渡状态：等待新鲜帧
+     GIMBAL_TRANSITION_STOPPED,      //  云台过渡状态：已停止
+     GIMBAL_TRANSITION_FAULT         //  云台过渡状态：故障
+-} Gimbal_Transition_State_t;        //  云台过渡状态类型
++} GimbalTransition;        //  云台过渡状态类型
+ 
+-static Gimbal_Transition_State_t Gimbal_Transition_State = GIMBAL_TRANSITION_IDLE;  //  云台过渡状态初始化为空闲
+-static uint8_t Gimbal_Transition_Start_Mode = 0U;       //  云台过渡开始模式
+-static uint8_t Gimbal_Transition_Pending_Mode = Run_Mode;   //  云台过渡挂起模式
+-static uint32_t Gimbal_Transition_Tick = 0U;    //  云台过渡时间戳
+-static uint8_t Gimbal_Transition_Zeroing_Seen = 0U;     //  已收到MaixCam 0x13 bit2清零保护标志
+-static uint8_t Gimbal_Startup_Zero_Pending = 1U;        //  第一帧有效姿态到达后执行一次启动清零
++static GimbalTransition gimbal_transition = GIMBAL_TRANSITION_IDLE;  //  云台过渡状态初始化为空闲
++static bool gimbal_transition_start_mode = false;       //  云台过渡开始模式
++static uint8_t gimbal_transition_pending_mode = Run_Mode;   //  云台过渡挂起模式
++static uint32_t gimbal_transition_tick_ms = 0U;    //  云台过渡时间戳
++static bool gimbal_zeroing_seen = false;     //  已收到MaixCam 0x13 bit2清零保护标志
++static bool gimbal_startup_zero_pending = true;        //  第一帧有效姿态到达后执行一次启动清零
+ 
+-static float Gimbal_ReadAttitudeRawDegrees(uint8_t axis)        //  读取云台姿态原始角度(度)函数
++static float gimbal_read_attitude_raw_deg(uint8_t axis)        //  读取云台姿态原始角度(度)函数
+ {
+     if (axis == MAIXCAM_ATTITUDE_AXIS_ROLL) //  如果轴为滚转轴
+         return (float)maixcam_attitude_raw_roll_count * MAIXCAM_ATTITUDE_RAW_DEG_SCALE;
+@@ -1668,21 +710,21 @@ static float Gimbal_ReadAttitudeRawDegrees(uint8_t axis)        //  读取云台
+     return (float)maixcam_attitude_raw_yaw_count * MAIXCAM_ATTITUDE_RAW_DEG_SCALE;
+ }
+ 
+-static float Gimbal_WrapDegrees(float value)    //  将角度值限制在[-180, 180]范围内的函数
++static float gimbal_wrap_degrees(float value)    //  将角度值限制在[-180, 180]范围内的函数
+ {
+     while (value > 180.0f) value -= 360.0f;
+     while (value <= -180.0f) value += 360.0f;
+     return value;
+ }
+ 
+-static uint8_t Gimbal_AttitudeFresh(void)   //  判断云台姿态数据是否新鲜的函数
++static uint8_t gimbal_attitude_fresh(void)   //  判断云台姿态数据是否新鲜的函数
+ {
+     return ((maixcam_attitude_raw_frame_count != 0U) &&
+             ((maixcam_attitude_raw_flags & MAIXCAM_IMU_FLAG_VALID) != 0U) &&
+             ((HAL_GetTick() - maixcam_last_attitude_raw_tick) <= GIMBAL_ATTITUDE_TIMEOUT_MS)) ? 1U : 0U;
+ }
+ 
+-static uint8_t Gimbal_VisionFresh(void) //  判断云台视觉数据是否新鲜的函数
++static uint8_t gimbal_vision_fresh(void) //  判断云台视觉数据是否新鲜的函数
+ {
+     uint8_t flags = MAIXCAM_FLAG_TARGET | MAIXCAM_FLAG_MAPPING | MAIXCAM_FLAG_AIM;
+     return ((maixcam_frame_count != 0U) &&
+@@ -1692,7 +734,7 @@ static uint8_t Gimbal_VisionFresh(void) //  判断云台视觉数据是否新鲜
+ 
+ /* Drop only the 0x53 difference state.  Used while the WT61 yaw reference
+    is being reset, so it deliberately preserves PID gains and target values. */
+-static void Gimbal_ClearAttitudeHistory(Gimbal_Axis_t *axis)    //  清除云台姿态历史数据函数
++static void gimbal_clear_attitude_history(GimbalAxisState *axis)    //  清除云台姿态历史数据函数
+ {
+     uint8_t index;
+     axis->measured_rate_rpm = 0.0f;
+@@ -1705,43 +747,43 @@ static void Gimbal_ClearAttitudeHistory(Gimbal_Axis_t *axis)    //  清除云台
+     }
+ }
+ 
+-static void Gimbal_ClearAxis(Gimbal_Axis_t *axis)   //  清除云台轴数据函数
++static void gimbal_clear_axis(GimbalAxisState *axis)   //  清除云台轴数据函数
+ {
+     axis->target_rate_rpm = 0.0f;
+     axis->target_speed_rpm = 0.0f;
+     axis->speed_command_rpm = 0.0f;
+-    Gimbal_ClearAttitudeHistory(axis);
++    gimbal_clear_attitude_history(axis);
+     axis->pixel_filter_ready = 0U;
+     axis->last_vision_count = maixcam_frame_count;
+     PID_Clear_State(axis->pixel_pid);
+     PID_Clear_State(axis->imu_rate_pid);
+ }
+ 
+-static void Gimbal_UpdateAttitudeRate(void) //  更新云台姿态速率函数
++static void gimbal_update_attitude_rate(void) //  更新云台姿态速率函数
+ {
+     uint8_t index;
+-    if (Gimbal_AttitudeFresh() == 0U) return;
++    if (gimbal_attitude_fresh() == 0U) return;
+ 
+     /* A yaw reset makes 0x53 jump to zero.  Suppress that artificial
+        difference and collect three new samples after the 100 ms guard. */
+     if ((maixcam_attitude_raw_flags & MAIXCAM_IMU_FLAG_YAW_ZEROING) != 0U)  
+     {
+-        for (index = 0U; index < VISION_AXIS_COUNT; index++)
++        for (index = 0U; index < GIMBAL_AXIS_COUNT; index++)
+         {
+-            Gimbal_ClearAttitudeHistory(&Gimbal_Axes[index]);
++            gimbal_clear_attitude_history(&gimbal_axes[index]);
+         }
+         return;
+     }
+ 
+-    for (index = 0U; index < VISION_AXIS_COUNT; index++)
++    for (index = 0U; index < GIMBAL_AXIS_COUNT; index++)
+     {
+-        Gimbal_Axis_t *axis = &Gimbal_Axes[index];
++        GimbalAxisState *axis = &gimbal_axes[index];
+         float angle_deg;
+         uint32_t tick;
+         uint32_t dt_ms;
+ 
+         if (axis->last_attitude_raw_count == maixcam_attitude_raw_frame_count) continue;
+-        angle_deg = axis->attitude_sign * Gimbal_ReadAttitudeRawDegrees(axis->attitude_axis);
++        angle_deg = axis->attitude_sign * gimbal_read_attitude_raw_deg(axis->attitude_axis);
+         tick = maixcam_last_attitude_raw_tick;
+         axis->last_attitude_raw_count = maixcam_attitude_raw_frame_count;
+ 
+@@ -1762,43 +804,43 @@ static void Gimbal_UpdateAttitudeRate(void) //  更新云台姿态速率函数
+ 
+         dt_ms = axis->attitude_tick_history[2] - axis->attitude_tick_history[0];
+         if (dt_ms == 0U) continue;
+-        axis->measured_rate_rpm = Gimbal_WrapDegrees(
++        axis->measured_rate_rpm = gimbal_wrap_degrees(
+             axis->attitude_history_deg[2] - axis->attitude_history_deg[0]) *
+             (1000.0f / (float)dt_ms) / 6.0f;
+     }
+ }
+ 
+-static uint8_t Gimbal_AttitudeRateReady(const Gimbal_Axis_t *axis)  //  判断云台姿态速率是否准备好的函数
++static uint8_t gimbal_attitude_rate_ready(const GimbalAxisState *axis)  //  判断云台姿态速率是否准备好的函数
+ {
+     return (axis->attitude_sample_count >= GIMBAL_ATTITUDE_HISTORY_SIZE) ? 1U : 0U;
+ }
+ 
+-static float Gimbal_PixelActual(Vision_Axis_Index_t index)  //  获取云台像素实际值函数
++static float gimbal_pixel_actual(GimbalAxis index)  //  获取云台像素实际值函数
+ {
+-    return (index == VISION_AXIS_X) ? (float)maixcam_center_x : (float)maixcam_center_y;
++    return (index == GIMBAL_AXIS_X) ? (float)maixcam_center_x : (float)maixcam_center_y;
+ }
+ 
+-static float Gimbal_PixelTarget(Vision_Axis_Index_t index)  //  获取云台像素目标值函数
++static float gimbal_pixel_target(GimbalAxis index)  //  获取云台像素目标值函数
+ {
+-    return (index == VISION_AXIS_X) ? VISION_IMAGE_CENTER_X_PX : VISION_IMAGE_CENTER_Y_PX;
++    return (index == GIMBAL_AXIS_X) ? GIMBAL_IMAGE_CENTER_X_PX : GIMBAL_IMAGE_CENTER_Y_PX;
+ }
+ 
+-static void Gimbal_UpdatePixelTarget(Vision_Axis_Index_t index) //  更新云台像素目标值函数
++static void gimbal_update_pixel_target(GimbalAxis index) //  更新云台像素目标值函数
+ {
+-    Gimbal_Axis_t *axis = &Gimbal_Axes[index];
++    GimbalAxisState *axis = &gimbal_axes[index];
+     float actual;
+     float correction;
+     if (axis->last_vision_count == maixcam_frame_count) return;
+     axis->last_vision_count = maixcam_frame_count;
+-    actual = Gimbal_PixelActual(index);
++    actual = gimbal_pixel_actual(index);
+     if (axis->pixel_filter_ready == 0U)
+     {
+         axis->pixel_filtered = actual;
+         axis->pixel_filter_ready = 1U;
+     }
+-    else axis->pixel_filtered += VISION_FILTER_ALPHA * (actual - axis->pixel_filtered);
++    else axis->pixel_filtered += GIMBAL_PIXEL_FILTER_ALPHA * (actual - axis->pixel_filtered);
+ 
+-    set_pid_target(axis->pixel_pid, Gimbal_PixelTarget(index));
++    set_pid_target(axis->pixel_pid, gimbal_pixel_target(index));
+     correction = pid_realize_limited(axis->pixel_pid, axis->pixel_filtered,
+                                      GIMBAL_MAX_GIMBAL_RPM,
+                                      GIMBAL_PID_INTEGRAL_LIMIT,
+@@ -1806,7 +848,7 @@ static void Gimbal_UpdatePixelTarget(Vision_Axis_Index_t index) //  更新云台
+     axis->target_rate_rpm = axis->pixel_sign * correction;
+ }
+ 
+-static void Gimbal_CommandSpeed(Gimbal_Axis_t *axis)    //  向云台轴发送速度命令函数
++static void gimbal_command_speed(GimbalAxisState *axis)    //  向云台轴发送速度命令函数
+ {
+     uint8_t ok;
+     /* Send the current PID output directly; no per-period slew limiter is used
+@@ -1816,13 +858,13 @@ static void Gimbal_CommandSpeed(Gimbal_Axis_t *axis)    //  向云台轴发送
+                                            GIMBAL_MAX_SPEED_RPM);
+     ok = QD4310_SetSpeed(axis->motor, axis->speed_sign * axis->speed_command_rpm);
+     if ((ok == 0U) && (axis->motor->consecutive_failures >= GIMBAL_COMMAND_FAILURE_LIMIT))
+-        Gimbal_Serial_Fault = 1U;
++        gimbal_serial_fault = 1U;
+ }
+ 
+ /* This PID is used only for the gimbal attitude-difference speed loop.
+    Kp: motor-rpm/gimbal-rpm, Ki: motor-rpm/(gimbal-rpm*s),
+    Kd: motor-rpm*s/gimbal-rpm. */
+-static float Gimbal_RatePidRealize(_pid *pid, float actual_rpm) //  云台速率PID实现函数
++static float gimbal_rate_pid_update(_pid *pid, float actual_rpm) //  云台速率PID实现函数
+ {
+     float integral_next;
+     float output_next;
+@@ -1858,12 +900,12 @@ static float Gimbal_RatePidRealize(_pid *pid, float actual_rpm) //  云台速率
+     return pid->output;
+ }
+ 
+-static void Gimbal_StopOutputs(void)    //  停止云台输出函数
++static void gimbal_stop_outputs(void)    //  停止云台输出函数
+ {
+     uint8_t index;
+-    for (index = 0U; index < VISION_AXIS_COUNT; index++)
++    for (index = 0U; index < GIMBAL_AXIS_COUNT; index++)
+     {
+-        Gimbal_Axis_t *axis = &Gimbal_Axes[index];
++        GimbalAxisState *axis = &gimbal_axes[index];
+         axis->target_speed_rpm = 0.0f;
+         axis->speed_command_rpm = 0.0f;
+         axis->test_current_a = 0.0f;
+@@ -1876,207 +918,207 @@ static void Gimbal_StopOutputs(void)    //  停止云台输出函数
+     }
+ }
+ 
+-static void Gimbal_RunAxis(Gimbal_Axis_t *axis, Vision_Axis_Index_t index)  //  运行云台轴函数
++static void gimbal_run_axis(GimbalAxisState *axis, GimbalAxis index)  //  运行云台轴函数
+ {
+     if (*(axis->enabled) == 0U) return;
+-    if (Gimbal_Mode == GIMBAL_MODE_CURRENT_TEST)
++    if (gimbal_mode == GIMBAL_MODE_CURRENT_TEST)
+     {
+         (void)QD4310_SetCurrent(axis->motor, axis->test_current_a);
+         return;
+     }
+-    if (Gimbal_AttitudeRateReady(axis) == 0U)
++    if (gimbal_attitude_rate_ready(axis) == 0U)
+     {
+         axis->target_speed_rpm = 0.0f;
+         axis->speed_command_rpm = 0.0f;
+         (void)QD4310_SetSpeed(axis->motor, 0.0f);
+         return;
+     }
+-    else if (Gimbal_Mode == GIMBAL_MODE_IMU_RATE_TEST)
++    else if (gimbal_mode == GIMBAL_MODE_IMU_RATE_TEST)
+     {
+         axis->target_rate_rpm = axis->test_imu_rate_rpm;
+         set_pid_target(axis->imu_rate_pid, axis->target_rate_rpm);
+-        axis->target_speed_rpm = Gimbal_RatePidRealize(axis->imu_rate_pid,
++        axis->target_speed_rpm = gimbal_rate_pid_update(axis->imu_rate_pid,
+                                                         axis->measured_rate_rpm);
+     }
+     else
+     {
+-        if (Gimbal_Mode == GIMBAL_MODE_PIXEL_TRACK) Gimbal_UpdatePixelTarget(index);
++        if (gimbal_mode == GIMBAL_MODE_PIXEL_TRACK) gimbal_update_pixel_target(index);
+         set_pid_target(axis->imu_rate_pid, axis->target_rate_rpm);
+-        axis->target_speed_rpm = Gimbal_RatePidRealize(axis->imu_rate_pid,
++        axis->target_speed_rpm = gimbal_rate_pid_update(axis->imu_rate_pid,
+                                                         axis->measured_rate_rpm);
+     }
+-    Gimbal_CommandSpeed(axis);
++    gimbal_command_speed(axis);
+ }
+ 
+-static void Gimbal_EnableAxis(Vision_Axis_Index_t index)    //  使能云台轴函数
++static void gimbal_enable_axis(GimbalAxis index)    //  使能云台轴函数
+ {
+-    Gimbal_Axis_t *axis = &Gimbal_Axes[index];
++    GimbalAxisState *axis = &gimbal_axes[index];
+     if (*(axis->enabled) == 0U)
+     {
+-        if (QD4310_Enable(axis->motor) == false) Gimbal_Serial_Fault = 1U;
++        if (QD4310_Enable(axis->motor) == false) gimbal_serial_fault = 1U;
+         *(axis->enabled) = 1U;
+     }
+-    Gimbal_ClearAxis(axis);
++    gimbal_clear_axis(axis);
+ }
+ 
+-static void Gimbal_DisableAxis(Vision_Axis_Index_t index)   //  禁用云台轴函数
++static void gimbal_disable_axis(GimbalAxis index)   //  禁用云台轴函数
+ {
+-    Gimbal_Axis_t *axis = &Gimbal_Axes[index];
++    GimbalAxisState *axis = &gimbal_axes[index];
+     /* Always transmit the safe state.  The MCU may have just reset while the
+        QD4310 is still enabled, so the software enable flag cannot be trusted. */
+     (void)QD4310_SetCurrent(axis->motor, 0.0f);
+     (void)QD4310_Disable(axis->motor);
+     *(axis->enabled) = 0U;
+-    Gimbal_ClearAxis(axis);
++    gimbal_clear_axis(axis);
+ }
+ 
+-void Vision_Control_Start(void) //  启动视觉控制函数
++void gimbal_start(void) //  启动视觉控制函数
+ {
+-    if ((Gimbal_AttitudeFresh() == 0U) || (Gimbal_VisionFresh() == 0U))
++    if ((gimbal_attitude_fresh() == 0U) || (gimbal_vision_fresh() == 0U))
+     {
+-        Vision_Target_Lost = 1U;
++        gimbal_target_lost = 1U;
+         return;
+     }
+-    Gimbal_Mode = GIMBAL_MODE_PIXEL_TRACK;
+-    Vision_Control_Active = 1U;
+-    Vision_Target_Lost = 0U;
+-    Gimbal_Last_Inner_Tick = 0U;
+-    Gimbal_ClearAxis(&Gimbal_Axes[VISION_AXIS_X]);
+-    Gimbal_ClearAxis(&Gimbal_Axes[VISION_AXIS_Y]);
++    gimbal_mode = GIMBAL_MODE_PIXEL_TRACK;
++    gimbal_active = 1U;
++    gimbal_target_lost = 0U;
++    gimbal_last_inner_tick_ms = 0U;
++    gimbal_clear_axis(&gimbal_axes[GIMBAL_AXIS_X]);
++    gimbal_clear_axis(&gimbal_axes[GIMBAL_AXIS_Y]);
+ }
+ 
+-void Vision_Control_StartBothMotors(void)   //  启动视觉控制并使能两个电机函数
++void gimbal_start_both(void)   //  启动视觉控制并使能两个电机函数
+ {
+-    Gimbal_Serial_Fault = 0U;
+-    Gimbal_EnableAxis(VISION_AXIS_X);
+-    Gimbal_EnableAxis(VISION_AXIS_Y);
+-    Vision_Control_Start();
++    gimbal_serial_fault = 0U;
++    gimbal_enable_axis(GIMBAL_AXIS_X);
++    gimbal_enable_axis(GIMBAL_AXIS_Y);
++    gimbal_start();
+ }
+ 
+-void Vision_Control_StartAxisVisual(uint8_t axis)   //  启动视觉控制并使能指定轴函数
++void gimbal_start_axis(uint8_t axis)   //  启动视觉控制并使能指定轴函数
+ {
+-    if (axis >= VISION_AXIS_COUNT) return;
+-    Gimbal_Serial_Fault = 0U;
+-    Gimbal_EnableAxis((Vision_Axis_Index_t)axis);
+-    Vision_Control_Start();
++    if (axis >= GIMBAL_AXIS_COUNT) return;
++    gimbal_serial_fault = 0U;
++    gimbal_enable_axis((GimbalAxis)axis);
++    gimbal_start();
+ }
+ 
+-void Vision_Control_StartPixelDebug(uint8_t axis) { Vision_Control_StartAxisVisual(axis); } //  启动像素调试函数
++void gimbal_start_pixel_debug(uint8_t axis) { gimbal_start_axis(axis); } //  启动像素调试函数
+ 
+-void Vision_Control_Stop(void)  //  停止视觉控制函数
++void gimbal_stop(void)  //  停止视觉控制函数
+ {
+-    Vision_Control_Active = 0U;
+-    Vision_Target_Lost = 0U;
+-    Vision_Rate_Debug_Active = 0U;
+-    Gimbal_StopOutputs();
++    gimbal_active = 0U;
++    gimbal_target_lost = 0U;
++    gimbal_rate_debug = 0U;
++    gimbal_stop_outputs();
+ }
+ 
+-void Vision_Control_Toggle(void) { if (Vision_Control_Active != 0U) Vision_Control_Stop(); else Vision_Control_Start(); }   //  切换视觉控制状态函数
+-void Vision_Control_ToggleXMotor(void) { if (Vision_X_Motor_Enabled != 0U) Gimbal_DisableAxis(VISION_AXIS_X); else Gimbal_EnableAxis(VISION_AXIS_X); }  //  切换X轴电机状态函数
+-void Vision_Control_ToggleYMotor(void) { if (Vision_Y_Motor_Enabled != 0U) Gimbal_DisableAxis(VISION_AXIS_Y); else Gimbal_EnableAxis(VISION_AXIS_Y); }  //  切换Y轴电机状态函数
++void gimbal_toggle(void) { if (gimbal_active != 0U) gimbal_stop(); else gimbal_start(); }   //  切换视觉控制状态函数
++void gimbal_toggle_x_motor(void) { if (gimbal_x_enabled != 0U) gimbal_disable_axis(GIMBAL_AXIS_X); else gimbal_enable_axis(GIMBAL_AXIS_X); }  //  切换X轴电机状态函数
++void gimbal_toggle_y_motor(void) { if (gimbal_y_enabled != 0U) gimbal_disable_axis(GIMBAL_AXIS_Y); else gimbal_enable_axis(GIMBAL_AXIS_Y); }  //  切换Y轴电机状态函数
+ 
+-void Vision_Control_StartImuRateDebug(uint8_t axis) //  启动IMU速率调试函数
++void gimbal_start_rate_debug(uint8_t axis) //  启动IMU速率调试函数
+ {
+     float saved_target_rpm;
+-    if (axis >= VISION_AXIS_COUNT) return;
+-    saved_target_rpm = Gimbal_Axes[axis].test_imu_rate_rpm;
+-    Vision_Control_Stop();
+-    Gimbal_Serial_Fault = 0U;
+-    Gimbal_EnableAxis((Vision_Axis_Index_t)axis);
+-    Gimbal_Axes[axis].test_imu_rate_rpm = Limit_Float(saved_target_rpm,
++    if (axis >= GIMBAL_AXIS_COUNT) return;
++    saved_target_rpm = gimbal_axes[axis].test_imu_rate_rpm;
++    gimbal_stop();
++    gimbal_serial_fault = 0U;
++    gimbal_enable_axis((GimbalAxis)axis);
++    gimbal_axes[axis].test_imu_rate_rpm = Limit_Float(saved_target_rpm,
+                                                        -GIMBAL_MAX_GIMBAL_RPM,
+                                                        GIMBAL_MAX_GIMBAL_RPM);
+-    set_pid_target(Gimbal_Axes[axis].imu_rate_pid, Gimbal_Axes[axis].test_imu_rate_rpm);
+-    Gimbal_Mode = GIMBAL_MODE_IMU_RATE_TEST;
+-    Vision_Control_Active = 1U;
+-    Vision_Rate_Debug_Active = 1U;
+-    Gimbal_Last_Inner_Tick = 0U;
+-}
+-void Vision_Control_StartCurrentDebug(uint8_t axis, float current_a)    //  启动电流调试函数
+-{
+-    if (axis >= VISION_AXIS_COUNT) return;
+-    Vision_Control_Stop();
+-    Gimbal_Serial_Fault = 0U;
+-    Gimbal_EnableAxis((Vision_Axis_Index_t)axis);
+-    Gimbal_Axes[axis].test_current_a = Limit_Float(current_a, -QD4310_MAX_CURRENT, QD4310_MAX_CURRENT);
+-    Gimbal_Mode = GIMBAL_MODE_CURRENT_TEST;
+-    Vision_Control_Active = 1U;
+-    Gimbal_Last_Inner_Tick = 0U;
+-}
+-void Vision_Control_SetImuRateDebugTarget(uint8_t axis, float target_rpm)   //  设置IMU速率调试目标函数
+-{
+-    if (axis >= VISION_AXIS_COUNT) return;
+-    Gimbal_Axes[axis].test_imu_rate_rpm = Limit_Float(target_rpm,
++    set_pid_target(gimbal_axes[axis].imu_rate_pid, gimbal_axes[axis].test_imu_rate_rpm);
++    gimbal_mode = GIMBAL_MODE_IMU_RATE_TEST;
++    gimbal_active = 1U;
++    gimbal_rate_debug = 1U;
++    gimbal_last_inner_tick_ms = 0U;
++}
++void gimbal_start_current_debug(uint8_t axis, float current_a)    //  启动电流调试函数
++{
++    if (axis >= GIMBAL_AXIS_COUNT) return;
++    gimbal_stop();
++    gimbal_serial_fault = 0U;
++    gimbal_enable_axis((GimbalAxis)axis);
++    gimbal_axes[axis].test_current_a = Limit_Float(current_a, -QD4310_MAX_CURRENT, QD4310_MAX_CURRENT);
++    gimbal_mode = GIMBAL_MODE_CURRENT_TEST;
++    gimbal_active = 1U;
++    gimbal_last_inner_tick_ms = 0U;
++}
++void gimbal_set_rate_target(uint8_t axis, float target_rpm)   //  设置IMU速率调试目标函数
++{
++    if (axis >= GIMBAL_AXIS_COUNT) return;
++    gimbal_axes[axis].test_imu_rate_rpm = Limit_Float(target_rpm,
+                                                        -GIMBAL_MAX_GIMBAL_RPM,
+                                                        GIMBAL_MAX_GIMBAL_RPM);
+-    set_pid_target(Gimbal_Axes[axis].imu_rate_pid, Gimbal_Axes[axis].test_imu_rate_rpm);
++    set_pid_target(gimbal_axes[axis].imu_rate_pid, gimbal_axes[axis].test_imu_rate_rpm);
+ }
+-void Vision_Control_SetPixelDebugTarget(uint8_t axis, float target_px) { (void)axis; (void)target_px; }
+-void Vision_Control_SetTaskMode(uint8_t mode) { Vision_Selected_Task_Mode = mode; }
+-void Vision_Control_NextTaskMode(void) { Vision_Selected_Task_Mode++; }
+-uint8_t Vision_Control_GetTaskMode(void) { return Vision_Selected_Task_Mode; }
++void gimbal_set_pixel_target(uint8_t axis, float target_px) { (void)axis; (void)target_px; }
++void gimbal_set_task_mode(uint8_t mode) { gimbal_task_mode = mode; }
++void gimbal_next_task_mode(void) { gimbal_task_mode++; }
++uint8_t gimbal_get_task_mode(void) { return gimbal_task_mode; }
+ 
+-void Vision_Control_DisableAllMotors(void)  //  禁用所有电机函数
++void gimbal_disable_all(void)  //  禁用所有电机函数
+ {
+-    Vision_Control_Stop();
+-    Gimbal_DisableAxis(VISION_AXIS_X);
+-    Gimbal_DisableAxis(VISION_AXIS_Y);
++    gimbal_stop();
++    gimbal_disable_axis(GIMBAL_AXIS_X);
++    gimbal_disable_axis(GIMBAL_AXIS_Y);
+ }
+ 
+-static void Gimbal_TransitionFault(void)    //  云台过渡故障处理函数
++static void gimbal_transition_fault(void)    //  云台过渡故障处理函数
+ {
+-    Vision_Control_DisableAllMotors();
+-    Gimbal_Transition_Start_Mode = 0U;
+-    Gimbal_Transition_State = GIMBAL_TRANSITION_FAULT;
++    gimbal_disable_all();
++    gimbal_transition_start_mode = 0U;
++    gimbal_transition = GIMBAL_TRANSITION_FAULT;
+ }
+ 
+-static void Gimbal_StartPendingMode(void)   //  启动挂起模式函数
++static void gimbal_start_pending_mode(void)   //  启动挂起模式函数
+ {
+-    if (Gimbal_Transition_Pending_Mode == X_Rate_Mode)
++    if (gimbal_transition_pending_mode == X_Rate_Mode)
+     {
+-        Vision_Control_StartImuRateDebug(VISION_AXIS_X);
++        gimbal_start_rate_debug(GIMBAL_AXIS_X);
+     }
+-    else if (Gimbal_Transition_Pending_Mode == Y_Rate_Mode)
++    else if (gimbal_transition_pending_mode == Y_Rate_Mode)
+     {
+-        Vision_Control_StartImuRateDebug(VISION_AXIS_Y);
++        gimbal_start_rate_debug(GIMBAL_AXIS_Y);
+     }
+-    else if (Gimbal_Transition_Pending_Mode == X_Mode)
++    else if (gimbal_transition_pending_mode == X_Mode)
+     {
+-        if ((Gimbal_AttitudeFresh() == 0U) || (Gimbal_VisionFresh() == 0U))
++        if ((gimbal_attitude_fresh() == 0U) || (gimbal_vision_fresh() == 0U))
+         {
+-            Vision_Target_Lost = 1U;
+-            Gimbal_Transition_State = GIMBAL_TRANSITION_STOPPED;
++            gimbal_target_lost = 1U;
++            gimbal_transition = GIMBAL_TRANSITION_STOPPED;
+             return;
+         }
+-        Vision_Control_StartPixelDebug(VISION_AXIS_X);
++        gimbal_start_pixel_debug(GIMBAL_AXIS_X);
+     }
+-    else if (Gimbal_Transition_Pending_Mode == Y_Mode)
++    else if (gimbal_transition_pending_mode == Y_Mode)
+     {
+-        if ((Gimbal_AttitudeFresh() == 0U) || (Gimbal_VisionFresh() == 0U))
++        if ((gimbal_attitude_fresh() == 0U) || (gimbal_vision_fresh() == 0U))
+         {
+-            Vision_Target_Lost = 1U;
+-            Gimbal_Transition_State = GIMBAL_TRANSITION_STOPPED;
++            gimbal_target_lost = 1U;
++            gimbal_transition = GIMBAL_TRANSITION_STOPPED;
+             return;
+         }
+-        Vision_Control_StartPixelDebug(VISION_AXIS_Y);
++        gimbal_start_pixel_debug(GIMBAL_AXIS_Y);
+     }
+     else
+     {
+-        Gimbal_Transition_State = GIMBAL_TRANSITION_STOPPED;
++        gimbal_transition = GIMBAL_TRANSITION_STOPPED;
+         return;
+     }
+ 
+-    Gimbal_Transition_State = GIMBAL_TRANSITION_IDLE;
++    gimbal_transition = GIMBAL_TRANSITION_IDLE;
+ }
+ 
+-static void Gimbal_ServiceTransition(void)  //  云台过渡服务函数
++static void gimbal_service_transition(void)  //  云台过渡服务函数
+ {
+     uint32_t now = HAL_GetTick();
+ 
+-    if (Gimbal_Transition_State != GIMBAL_TRANSITION_WAIT_FRESH) return;
+-    if ((now - Gimbal_Transition_Tick) > GIMBAL_ZERO_FRESH_TIMEOUT_MS)
++    if (gimbal_transition != GIMBAL_TRANSITION_WAIT_FRESH) return;
++    if ((now - gimbal_transition_tick_ms) > GIMBAL_ZERO_FRESH_TIMEOUT_MS)
+     {
+-        Gimbal_TransitionFault();
++        gimbal_transition_fault();
+         return;
+     }
+ 
+@@ -2085,166 +1127,166 @@ static void Gimbal_ServiceTransition(void)  //  云台过渡服务函数
+        for three genuinely new unflagged attitude frames. */
+     if ((maixcam_attitude_raw_flags & MAIXCAM_IMU_FLAG_YAW_ZEROING) != 0U)
+     {
+-        Gimbal_Transition_Zeroing_Seen = 1U;
+-        Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_X]);
+-        Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_Y]);
++        gimbal_zeroing_seen = 1U;
++        gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_X]);
++        gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_Y]);
+         return;
+     }
+ 
+     /* Do not accept samples captured before MaixCam has acknowledged the
+        request through bit2.  This closes the UART round-trip race without a
+        separate ACK packet or callback-owned state machine. */
+-    if (Gimbal_Transition_Zeroing_Seen == 0U)
++    if (gimbal_zeroing_seen == 0U)
+     {
+-        Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_X]);
+-        Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_Y]);
++        gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_X]);
++        gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_Y]);
+         return;
+     }
+ 
+-    if ((Gimbal_AttitudeRateReady(&Gimbal_Axes[VISION_AXIS_X]) != 0U) &&
+-        (Gimbal_AttitudeRateReady(&Gimbal_Axes[VISION_AXIS_Y]) != 0U))
++    if ((gimbal_attitude_rate_ready(&gimbal_axes[GIMBAL_AXIS_X]) != 0U) &&
++        (gimbal_attitude_rate_ready(&gimbal_axes[GIMBAL_AXIS_Y]) != 0U))
+     {
+-        if (Gimbal_Transition_Start_Mode != 0U)
+-            Gimbal_StartPendingMode();
++        if (gimbal_transition_start_mode != 0U)
++            gimbal_start_pending_mode();
+         else
+-            Gimbal_Transition_State = GIMBAL_TRANSITION_STOPPED;
++            gimbal_transition = GIMBAL_TRANSITION_STOPPED;
+         return;
+     }
+ }
+ 
+-static void Gimbal_RequestTransition(uint8_t mode, uint8_t start_mode)  //  请求云台过渡函数
++static void gimbal_request_transition(uint8_t mode, uint8_t start_mode)  //  请求云台过渡函数
+ {
+     /* Repeated page/STOP presses share the in-flight WT61 transaction.  The
+        latest page wins, while STOP always overrides automatic re-enable. */
+-    if (Gimbal_Transition_State == GIMBAL_TRANSITION_WAIT_FRESH)
++    if (gimbal_transition == GIMBAL_TRANSITION_WAIT_FRESH)
+     {
+-        Gimbal_Transition_Pending_Mode = mode;
++        gimbal_transition_pending_mode = mode;
+         /* STOP is sticky for the active transaction.  A later page key may
+            select the next page but cannot re-enable motors until a new
+            transaction is started from STOPPED. */
+         if (start_mode == 0U)
+-            Gimbal_Transition_Start_Mode = 0U;
++            gimbal_transition_start_mode = 0U;
+         return;
+     }
+ 
+-    Vision_Control_DisableAllMotors();
+-    Gimbal_Startup_Zero_Pending = 0U;
+-    Gimbal_Transition_Pending_Mode = mode;
+-    Gimbal_Transition_Start_Mode = start_mode;
+-    Gimbal_Transition_Tick = HAL_GetTick();
+-    Gimbal_Transition_Zeroing_Seen = 0U;
+-    Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_X]);
+-    Gimbal_ClearAttitudeHistory(&Gimbal_Axes[VISION_AXIS_Y]);
+-    Gimbal_Transition_State = GIMBAL_TRANSITION_WAIT_FRESH;
++    gimbal_disable_all();
++    gimbal_startup_zero_pending = 0U;
++    gimbal_transition_pending_mode = mode;
++    gimbal_transition_start_mode = start_mode;
++    gimbal_transition_tick_ms = HAL_GetTick();
++    gimbal_zeroing_seen = 0U;
++    gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_X]);
++    gimbal_clear_attitude_history(&gimbal_axes[GIMBAL_AXIS_Y]);
++    gimbal_transition = GIMBAL_TRANSITION_WAIT_FRESH;
+     MaixCam_ZeroYaw();
+ }
+ 
+-void Vision_Control_RequestGimbalMode(uint8_t mode) //  请求云台模式函数
++void gimbal_request_mode(uint8_t mode) //  请求云台模式函数
+ {
+     if (mode == X_Rate_Mode)
+     {
+-        Vision_Control_SetImuRateDebugTarget(VISION_AXIS_X, 0.0f);
++        gimbal_set_rate_target(GIMBAL_AXIS_X, 0.0f);
+     }
+     else if (mode == Y_Rate_Mode)
+     {
+-        Vision_Control_SetImuRateDebugTarget(VISION_AXIS_Y, 0.0f);
++        gimbal_set_rate_target(GIMBAL_AXIS_Y, 0.0f);
+     }
+-    Gimbal_RequestTransition(mode, 1U);
++    gimbal_request_transition(mode, 1U);
+ }
+ 
+-void Vision_Control_RequestGimbalStop(void) //  请求云台停止函数
++void gimbal_request_stop(void) //  请求云台停止函数
+ {
+-    Gimbal_RequestTransition(Car_Mode, 0U);
++    gimbal_request_transition(Car_Mode, 0U);
+ }
+ 
+-void Vision_Control_Task(void)  //  视觉控制任务函数
++void gimbal_task(void)  //  视觉控制任务函数
+ {
+     uint32_t now = HAL_GetTick();   //  获取当前时间戳
+-    if ((Gimbal_Startup_Zero_Pending != 0U) && (Gimbal_AttitudeFresh() != 0U))
+-        Gimbal_RequestTransition(Run_Mode, 1U);
+-    Gimbal_UpdateAttitudeRate();    //  更新云台姿态速率
+-    Gimbal_ServiceTransition();     //  服务云台过渡状态
+-    if (Gimbal_Transition_State != GIMBAL_TRANSITION_IDLE) return;  //  如果云台过渡状态不为空闲，则返回
+-    if (Vision_Control_Active == 0U) return;    //  如果视觉控制不活跃，则返回
+-    if ((now - Gimbal_Last_Inner_Tick) < GIMBAL_INNER_PERIOD_MS) return;    //  如果距离上一次内部周期时间戳小于云台内部周期时间，则返回
+-    Gimbal_Last_Inner_Tick = now;   //  更新云台上一次内部周期时间戳为当前时间戳
+-    if ((Gimbal_AttitudeFresh() == 0U) || (Gimbal_Serial_Fault != 0U) ||    //  如果云台姿态数据不新鲜、云台串口故障标志不为0或云台视觉数据不新鲜，则执行以下操作
+-        ((Gimbal_Mode == GIMBAL_MODE_PIXEL_TRACK) && (Gimbal_VisionFresh() == 0U)))    
+-    {
+-        Vision_Target_Lost = 1U;    //  设置视觉目标丢失标志为1
++    if ((gimbal_startup_zero_pending != 0U) && (gimbal_attitude_fresh() != 0U))
++        gimbal_request_transition(Run_Mode, 1U);
++    gimbal_update_attitude_rate();    //  更新云台姿态速率
++    gimbal_service_transition();     //  服务云台过渡状态
++    if (gimbal_transition != GIMBAL_TRANSITION_IDLE) return;  //  如果云台过渡状态不为空闲，则返回
++    if (gimbal_active == 0U) return;    //  如果视觉控制不活跃，则返回
++    if ((now - gimbal_last_inner_tick_ms) < GIMBAL_INNER_PERIOD_MS) return;    //  如果距离上一次内部周期时间戳小于云台内部周期时间，则返回
++    gimbal_last_inner_tick_ms = now;   //  更新云台上一次内部周期时间戳为当前时间戳
++    if ((gimbal_attitude_fresh() == 0U) || (gimbal_serial_fault != 0U) ||    //  如果云台姿态数据不新鲜、云台串口故障标志不为0或云台视觉数据不新鲜，则执行以下操作
++        ((gimbal_mode == GIMBAL_MODE_PIXEL_TRACK) && (gimbal_vision_fresh() == 0U)))
++    {
++        gimbal_target_lost = 1U;    //  设置视觉目标丢失标志为1
+         /* Fault stop order: speed=0, current=0, then disable both motors. */
+-        Gimbal_StopOutputs();   //  停止云台输出
+-        Gimbal_DisableAxis(VISION_AXIS_X);  //  禁用云台X轴
+-        Gimbal_DisableAxis(VISION_AXIS_Y);  //  禁用云台Y轴
+-        Vision_Control_Active = 0U; //  设置视觉控制活跃标志为0
++        gimbal_stop_outputs();   //  停止云台输出
++        gimbal_disable_axis(GIMBAL_AXIS_X);  //  禁用云台X轴
++        gimbal_disable_axis(GIMBAL_AXIS_Y);  //  禁用云台Y轴
++        gimbal_active = 0U; //  设置视觉控制活跃标志为0
+         return; 
+     }
+-    Gimbal_RunAxis(&Gimbal_Axes[VISION_AXIS_X], VISION_AXIS_X); //  运行云台X轴
+-    Gimbal_RunAxis(&Gimbal_Axes[VISION_AXIS_Y], VISION_AXIS_Y); //  运行云台Y轴
+-}
+-
+-uint8_t Vision_Control_IsActive(void) { return Vision_Control_Active; } //  判断视觉控制是否活跃函数
+-uint8_t Vision_Control_IsTargetValid(void) { return Gimbal_VisionFresh(); }//  判断视觉目标是否有效函数
+-uint8_t Vision_Control_IsRateDebugActive(void) { return Vision_Rate_Debug_Active; }//   判断速率调试是否活跃函数
+-uint8_t Vision_Control_IsXMotorEnabled(void) { return Vision_X_Motor_Enabled; } //  判断X轴电机是否使能函数
+-uint8_t Vision_Control_IsYMotorEnabled(void) { return Vision_Y_Motor_Enabled; } //  判断Y轴电机是否使能函数
+-const char *Vision_Control_GetStateText(void)   //  获取视觉控制状态文本函数
+-{
+-    if (Gimbal_Transition_State == GIMBAL_TRANSITION_FAULT) return "MAIX";  //  云台过渡故障
+-    if (Gimbal_Transition_State == GIMBAL_TRANSITION_WAIT_FRESH) return "FRESH";    //  云台过渡等待新鲜帧
+-    if (Gimbal_Transition_State == GIMBAL_TRANSITION_STOPPED) return "STOP";        //  云台过渡已停止
+-    if (Gimbal_Serial_Fault != 0U) return "SER";        //  云台串口故障
+-    if (Vision_Target_Lost != 0U) return "LOST";        //  视觉目标丢失
+-    return (Vision_Control_Active != 0U) ? "RUN" : "OFF";   //  返回视觉控制状态文本
+-}
+-float Vision_Control_GetXRate(void) { return Gimbal_Axes[VISION_AXIS_X].measured_rate_rpm; }    //  获取云台X轴速率函数
+-float Vision_Control_GetYRate(void) { return Gimbal_Axes[VISION_AXIS_Y].measured_rate_rpm; }    //  获取云台Y轴速率函数
+-float Vision_Control_GetXMotorSpeedCommand(void) { return Gimbal_Axes[VISION_AXIS_X].speed_command_rpm; }   //  获取云台X轴电机速度命令函数
+-float Vision_Control_GetYMotorSpeedCommand(void) { return Gimbal_Axes[VISION_AXIS_Y].speed_command_rpm; }   //  获取云台Y轴电机速度命令函数
+-float Vision_Control_GetXRateCommand(void) { return Gimbal_Axes[VISION_AXIS_X].target_rate_rpm; }   //  获取云台X轴速率命令函数
+-float Vision_Control_GetYRateCommand(void) { return Gimbal_Axes[VISION_AXIS_Y].target_rate_rpm; }   //  获取云台Y轴速率命令函数
+-float Vision_Control_GetXPixelActual(void) { return Gimbal_PixelActual(VISION_AXIS_X); }    //  获取云台X轴像素实际值函数
+-float Vision_Control_GetYPixelActual(void) { return Gimbal_PixelActual(VISION_AXIS_Y); }    //  获取云台Y轴像素实际值函数
+-float Vision_Control_GetXPixelTarget(void) { return Gimbal_PixelTarget(VISION_AXIS_X); }    //  获取云台X轴像素目标值函数
+-float Vision_Control_GetYPixelTarget(void) { return Gimbal_PixelTarget(VISION_AXIS_Y); }    //  获取云台Y轴像素目标值函数
+-
+-void PID_Debug_Control_10ms(void)   //  PID调试控制函数，每10毫秒执行一次
++    gimbal_run_axis(&gimbal_axes[GIMBAL_AXIS_X], GIMBAL_AXIS_X); //  运行云台X轴
++    gimbal_run_axis(&gimbal_axes[GIMBAL_AXIS_Y], GIMBAL_AXIS_Y); //  运行云台Y轴
++}
++
++uint8_t gimbal_is_active(void) { return gimbal_active; } //  判断视觉控制是否活跃函数
++uint8_t gimbal_target_valid(void) { return gimbal_vision_fresh(); }//  判断视觉目标是否有效函数
++uint8_t gimbal_rate_debug_active(void) { return gimbal_rate_debug; }//   判断速率调试是否活跃函数
++uint8_t gimbal_x_motor_enabled(void) { return gimbal_x_enabled; } //  判断X轴电机是否使能函数
++uint8_t gimbal_y_motor_enabled(void) { return gimbal_y_enabled; } //  判断Y轴电机是否使能函数
++const char *gimbal_get_state_text(void)   //  获取视觉控制状态文本函数
++{
++    if (gimbal_transition == GIMBAL_TRANSITION_FAULT) return "MAIX";  //  云台过渡故障
++    if (gimbal_transition == GIMBAL_TRANSITION_WAIT_FRESH) return "FRESH";    //  云台过渡等待新鲜帧
++    if (gimbal_transition == GIMBAL_TRANSITION_STOPPED) return "STOP";        //  云台过渡已停止
++    if (gimbal_serial_fault != 0U) return "SER";        //  云台串口故障
++    if (gimbal_target_lost != 0U) return "LOST";        //  视觉目标丢失
++    return (gimbal_active != 0U) ? "RUN" : "OFF";   //  返回视觉控制状态文本
++}
++float gimbal_get_x_rate_rpm(void) { return gimbal_axes[GIMBAL_AXIS_X].measured_rate_rpm; }    //  获取云台X轴速率函数
++float gimbal_get_y_rate_rpm(void) { return gimbal_axes[GIMBAL_AXIS_Y].measured_rate_rpm; }    //  获取云台Y轴速率函数
++float gimbal_get_x_cmd_rpm(void) { return gimbal_axes[GIMBAL_AXIS_X].speed_command_rpm; }   //  获取云台X轴电机速度命令函数
++float gimbal_get_y_cmd_rpm(void) { return gimbal_axes[GIMBAL_AXIS_Y].speed_command_rpm; }   //  获取云台Y轴电机速度命令函数
++float gimbal_get_x_rate_target_rpm(void) { return gimbal_axes[GIMBAL_AXIS_X].target_rate_rpm; }   //  获取云台X轴速率命令函数
++float gimbal_get_y_rate_target_rpm(void) { return gimbal_axes[GIMBAL_AXIS_Y].target_rate_rpm; }   //  获取云台Y轴速率命令函数
++float gimbal_get_x_pixel_px(void) { return gimbal_pixel_actual(GIMBAL_AXIS_X); }    //  获取云台X轴像素实际值函数
++float gimbal_get_y_pixel_px(void) { return gimbal_pixel_actual(GIMBAL_AXIS_Y); }    //  获取云台Y轴像素实际值函数
++float gimbal_get_x_pixel_target_px(void) { return gimbal_pixel_target(GIMBAL_AXIS_X); }    //  获取云台X轴像素目标值函数
++float gimbal_get_y_pixel_target_px(void) { return gimbal_pixel_target(GIMBAL_AXIS_Y); }    //  获取云台Y轴像素目标值函数
++
++void control_debug_update_10ms(void)   //  PID调试控制函数，每10毫秒执行一次
+ {
+     float output;
+ 
+-    /* Gimbal modes are scheduled by Vision_Control_Task in the main loop. */
++    /* Gimbal modes are scheduled by gimbal_task in the main loop. */
+     if ((Car_Mode == Run_Mode) || (Car_Mode == X_Rate_Mode) ||
+         (Car_Mode == Y_Rate_Mode) || (Car_Mode == X_Mode) ||
+         (Car_Mode == Y_Mode)) return;
+-    if (car_go == 0U)
++    if (control_running == 0U)
+     {
+-        PID_Debug_Stop();
++        control_debug_stop();
+         return;
+     }
+ 
+     switch (Car_Mode)
+     {
+     case Speed_Mode:
+-        Speed_Set = (int)pid_speed.target_val;
+-        Cascade_Speed_Output(pid_speed.target_val, 0.0f);
++        speed_target_mm_s = (int)pid_speed.target_val;
++        set_wheel_speed(pid_speed.target_val, 0.0f);
+         break;
+     case Speed2_Mode:
+-        Speed_Set = (int)pid_speed2.target_val;
+-        Cascade_Speed_Output(0.0f, pid_speed2.target_val);
++        speed_target_mm_s = (int)pid_speed2.target_val;
++        set_wheel_speed(0.0f, pid_speed2.target_val);
+         break;
+     case Location_Mode:
+         output = location_pid_realize(&pid_location, pid_location.actual_val);
+-        Cascade_Speed_Output(output, output);
++        set_wheel_speed(output, output);
+         break;
+     case Angle_Mode:
+         output = angle_pid_realize(&pid_angle, Yaw);
+-        Cascade_Speed_Output(-output, output);
++        set_wheel_speed(-output, output);
+         break;
+     case Gray_Mode:
+-        Gray_Debug_Control_10ms();
++        gray_debug_update();
+         break;
+     default:
+-        PID_Debug_Stop();
++        control_debug_stop();
+         break;
+     }
+ }
+@@ -2259,16 +1301,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+     else if (htim->Instance == TIM7)
+     {
+         Encoder_Update();
+-        pid_location.actual_val = Get_Run_DistanceMm();
++        pid_location.actual_val = get_run_distance_mm();
+ 
+         if (Car_Mode == Run_Mode)
+         {
+-            if (car_go != 0U) Run_Line_Control_10ms();
+-            else if ((Run_State != RUN_LOST) && (Run_State != RUN_DONE)) Cascade_Stop();
++            if (control_running != 0U) line_control_update();
++            else if ((line_state != LINE_LOST) && (line_state != LINE_DONE)) stop_chassis();
+         }
+         else
+         {
+-            PID_Debug_Control_10ms();
++            control_debug_update_10ms();
+         }
+     }
+ }
+diff --git a/21F/21F/Hardware/control.h b/21F/21F/Hardware/control.h
+index aa3fe83..e721764 100644
+--- a/21F/21F/Hardware/control.h
++++ b/21F/21F/Hardware/control.h
+@@ -1,70 +1,121 @@
+-#ifndef __CONTROL_H
+-#define __CONTROL_H
++#ifndef CONTROL_H
++#define CONTROL_H
+ 
+ #include <stdint.h>
+ 
+-void Control_Start(void);
+-void Control_Stop(void);
+-void Control_Reset(void);
+-void Control_CompetitionReset(void);
+-void Control_NextSpeedGear(void);
+-uint8_t Control_GetSpeedGear(void);
+-float Control_GetLineBaseSpeed(void);
+-void Control_LineSensorUpdate(void);
+-uint8_t Control_NextLapTarget(void);
+-uint8_t Control_GetLapTarget(void);
+-uint8_t Control_GetLapDone(void);
+-uint8_t Control_GetTurnDone(void);
+-float Control_GetRunDistanceMm(void);
+-const char *Control_GetRunStateText(void);
+-void PID_Debug_Control_10ms(void);
+-void PID_Debug_Stop(void);
++/** @brief 启动底盘巡线任务并清零本次运行状态。 */
++void control_start(void);
++/** @brief 停止底盘巡线并清零底盘 PID 输出。 */
++void control_stop(void);
++/** @brief 复位巡线任务状态和编码器里程。 */
++void control_reset(void);
++/** @brief 恢复比赛默认控制状态，不修改灰度校准值。 */
++void control_competition_reset(void);
+ 
+-void Vision_Control_Start(void);
+-void Vision_Control_StartBothMotors(void);
+-void Vision_Control_StartPixelDebug(uint8_t axis);
+-void Vision_Control_StartAxisVisual(uint8_t axis);
+-void Vision_Control_Stop(void);
+-void Vision_Control_Toggle(void);
+-void Vision_Control_ToggleXMotor(void);
+-void Vision_Control_ToggleYMotor(void);
+-void Vision_Control_StartImuRateDebug(uint8_t axis);
+-void Vision_Control_StartCurrentDebug(uint8_t axis, float current_a);
+-void Vision_Control_DisableAllMotors(void);
+-/* Non-blocking yaw-zero transaction used by Wildfire STOP/page switching. */
+-void Vision_Control_RequestGimbalMode(uint8_t mode);
+-void Vision_Control_RequestGimbalStop(void);
+-/* X/Y IMU DIFF RPM mode: target and actual are both mechanical gimbal rpm. */
+-void Vision_Control_SetImuRateDebugTarget(uint8_t axis, float target_rpm);
+-void Vision_Control_SetPixelDebugTarget(uint8_t axis, float target_px);
+-void Vision_Control_SetTaskMode(uint8_t mode);
+-void Vision_Control_NextTaskMode(void);
+-uint8_t Vision_Control_GetTaskMode(void);
+-void Vision_Control_Task(void);
+-uint8_t Vision_Control_IsActive(void);
+-uint8_t Vision_Control_IsTargetValid(void);
+-uint8_t Vision_Control_IsRateDebugActive(void);
+-uint8_t Vision_Control_IsXMotorEnabled(void);
+-uint8_t Vision_Control_IsYMotorEnabled(void);
+-const char *Vision_Control_GetStateText(void);
+-float Vision_Control_GetXRate(void);
+-float Vision_Control_GetYRate(void);
+-float Vision_Control_GetXMotorSpeedCommand(void);
+-float Vision_Control_GetYMotorSpeedCommand(void);
+-float Vision_Control_GetXRateCommand(void);
+-float Vision_Control_GetYRateCommand(void);
+-float Vision_Control_GetXPixelActual(void);
+-float Vision_Control_GetYPixelActual(void);
+-float Vision_Control_GetXPixelTarget(void);
+-float Vision_Control_GetYPixelTarget(void);
++/** @brief 切换巡线速度档位。 */
++void control_next_speed_gear(void);
++/** @brief 获取当前巡线速度档位；返回值范围为 0 至 2。 */
++uint8_t control_get_speed_gear(void);
++/** @brief 获取当前档位基础速度；返回单位为 mm/s。 */
++float control_get_line_speed_mm_s(void);
++/** @brief 更新灰度传感器结果；应在主循环中周期调用。 */
++void control_line_sensor_update(void);
++/** @brief 循环设置目标圈数；返回值范围为 1 至 5。 */
++uint8_t control_next_lap_target(void);
++/** @brief 获取设置的目标圈数。 */
++uint8_t control_get_lap_target(void);
++/** @brief 获取已完成圈数。 */
++uint8_t control_get_lap_done(void);
++/** @brief 获取已完成的转弯节点数。 */
++uint8_t control_get_turn_done(void);
++/** @brief 获取扣除原地转向后的巡线里程；返回单位为 mm。 */
++float control_get_run_distance_mm(void);
++/** @brief 获取巡线状态文本；返回只读字符串。 */
++const char *control_get_line_state_text(void);
+ 
+-extern uint8_t car_go;
+-extern uint8_t Location_flag;
+-extern uint8_t Angle_flag;
+-extern uint8_t Gray_flag;
++/** @brief 执行一次 PID 调试模式控制；由 TIM7 的 10 ms 节拍调用。 */
++void control_debug_update_10ms(void);
++/** @brief 安全停止 PID 调试输出并清零相关 PID。 */
++void control_debug_stop(void);
+ 
+-extern int Speed_Set;
+-extern int SpeedL;
+-extern int SpeedR;
++/** @brief 启动默认云台模式；仅在姿态和视觉数据有效时使能。 */
++void gimbal_start(void);
++/** @brief 启动双轴云台输出。 */
++void gimbal_start_both(void);
++/** @brief 启动指定轴像素跟踪；@param axis 轴索引：0 为 X，1 为 Y。 */
++void gimbal_start_pixel_debug(uint8_t axis);
++/** @brief 启动指定轴视觉调试；@param axis 轴索引：0 为 X，1 为 Y。 */
++void gimbal_start_axis(uint8_t axis);
++/** @brief 停止云台输出并清零 PID 状态。 */
++void gimbal_stop(void);
++/** @brief 切换云台启停状态。 */
++void gimbal_toggle(void);
++/** @brief 切换 X 轴电机使能状态。 */
++void gimbal_toggle_x_motor(void);
++/** @brief 切换 Y 轴电机使能状态。 */
++void gimbal_toggle_y_motor(void);
++/** @brief 启动指定轴 IMU 角速度调试；@param axis 轴索引。 */
++void gimbal_start_rate_debug(uint8_t axis);
++/** @brief 启动指定轴电流测试；@param current_a 测试电流，单位 A。 */
++void gimbal_start_current_debug(uint8_t axis, float current_a);
++/** @brief 立即停止并失能两台云台电机。 */
++void gimbal_disable_all(void);
++/** @brief 请求切换云台模式；非阻塞，内部会等待姿态零位过渡。 */
++void gimbal_request_mode(uint8_t mode);
++/** @brief 请求云台安全停止；非阻塞。 */
++void gimbal_request_stop(void);
++/** @brief 设置角速度调试目标；@param target_rpm 机械角速度，单位 rpm。 */
++void gimbal_set_rate_target(uint8_t axis, float target_rpm);
++/** @brief 设置像素调试目标；@param target_px 图像坐标，单位 px。 */
++void gimbal_set_pixel_target(uint8_t axis, float target_px);
++/** @brief 设置按键选择的云台任务模式。 */
++void gimbal_set_task_mode(uint8_t mode);
++/** @brief 切换到下一云台任务模式。 */
++void gimbal_next_task_mode(void);
++/** @brief 获取当前选择的云台任务模式。 */
++uint8_t gimbal_get_task_mode(void);
++/** @brief 执行云台周期任务；应在主循环中持续调用。 */
++void gimbal_task(void);
++/** @brief 查询云台控制是否处于激活状态；返回 0 或 1。 */
++uint8_t gimbal_is_active(void);
++/** @brief 查询最新视觉目标是否在超时范围内有效；返回 0 或 1。 */
++uint8_t gimbal_target_valid(void);
++/** @brief 查询 IMU 角速度调试是否激活；返回 0 或 1。 */
++uint8_t gimbal_rate_debug_active(void);
++/** @brief 查询 X 轴电机是否已使能；返回 0 或 1。 */
++uint8_t gimbal_x_motor_enabled(void);
++/** @brief 查询 Y 轴电机是否已使能；返回 0 或 1。 */
++uint8_t gimbal_y_motor_enabled(void);
++/** @brief 获取云台状态文本；返回只读字符串。 */
++const char *gimbal_get_state_text(void);
++/** @brief 获取 X 轴实际角速度；返回单位为 rpm。 */
++float gimbal_get_x_rate_rpm(void);
++/** @brief 获取 Y 轴实际角速度；返回单位为 rpm。 */
++float gimbal_get_y_rate_rpm(void);
++/** @brief 获取 X 轴下发给 QD4310 的速度命令；返回单位为 rpm。 */
++float gimbal_get_x_cmd_rpm(void);
++/** @brief 获取 Y 轴下发给 QD4310 的速度命令；返回单位为 rpm。 */
++float gimbal_get_y_cmd_rpm(void);
++/** @brief 获取 X 轴 IMU 速度环目标；返回单位为 rpm。 */
++float gimbal_get_x_rate_target_rpm(void);
++/** @brief 获取 Y 轴 IMU 速度环目标；返回单位为 rpm。 */
++float gimbal_get_y_rate_target_rpm(void);
++/** @brief 获取 X 轴实际像素坐标；返回单位为 px。 */
++float gimbal_get_x_pixel_px(void);
++/** @brief 获取 Y 轴实际像素坐标；返回单位为 px。 */
++float gimbal_get_y_pixel_px(void);
++/** @brief 获取 X 轴像素目标；返回单位为 px。 */
++float gimbal_get_x_pixel_target_px(void);
++/** @brief 获取 Y 轴像素目标；返回单位为 px。 */
++float gimbal_get_y_pixel_target_px(void);
+ 
+-#endif
++/** @brief 巡线运行标志；0 为停止，非零为运行。 */
++extern uint8_t control_running;
++/** @brief 巡线基础速度调试值；单位 mm/s。 */
++extern int16_t speed_target_mm_s;
++/** @brief 左轮最终 PWM 调试值；范围沿用原电机接口。 */
++extern int16_t left_pwm;
++/** @brief 右轮最终 PWM 调试值；范围沿用原电机接口。 */
++extern int16_t right_pwm;
++
++#endif /* CONTROL_H */
+diff --git a/21F/21F/Hardware/drug/drug.c b/21F/21F/Hardware/drug/drug.c
+index 0fb80bf..4894c2e 100644
+--- a/21F/21F/Hardware/drug/drug.c
++++ b/21F/21F/Hardware/drug/drug.c
+@@ -151,11 +151,11 @@ void drug_scan(void)
+ 
+     /*
+      * 目标数字还没有识别出来，不允许发车
+-     * 防止药品先放上后，car_go 直接变 1，导致 MaixCAM 不再识别数字
++     * 防止药品先放上后，control_running 直接变 1，导致 MaixCAM 不再识别数字
+      */
+     if (target_number == 0)
+     {
+-        car_go = 0;
++        control_running = 0;
+         return;
+     }
+ 
+@@ -164,7 +164,7 @@ void drug_scan(void)
+      */
+     if (drug_mission_started == 0)
+     {
+-        car_go = 0;
++        control_running = 0;
+ 
+         if (task_state == 0)
+         {
+@@ -178,7 +178,7 @@ void drug_scan(void)
+                 Encoder_ResetDistance();
+                 JY61p_HardwareZeroYaw();
+ 
+-                car_go = 1;
++                control_running = 1;
+             }
+         }
+ 
+@@ -192,18 +192,14 @@ void drug_scan(void)
+         task_state == TASK_WAIT_MIDDLE_REMOVE ||
+         task_state == TASK_WAIT_FAR_REMOVE)
+     {
+-        car_go = 0;
++        control_running = 0;
+ 
+-        Location_flag = 0;
+-        Angle_flag = 0;
+-        Gray_flag = 0;
+-
+-        Motor_SetSpeed(MOTOR_LEFT, 0);
++Motor_SetSpeed(MOTOR_LEFT, 0);
+         Motor_SetSpeed(MOTOR_RIGHT, 0);
+ 
+         if (Drug_WaitRemove())
+         {
+-            car_go = 1;
++            control_running = 1;
+ 
+             if (task_state == TASK_WAIT_NEAR_REMOVE)
+             {
+diff --git a/21F/21F/System/bsp_debug/bsp_debug.c b/21F/21F/System/bsp_debug/bsp_debug.c
+index 2e79674..80b5faf 100644
+--- a/21F/21F/System/bsp_debug/bsp_debug.c
++++ b/21F/21F/System/bsp_debug/bsp_debug.c
+@@ -197,8 +197,8 @@ void Protocol_Datas_Proc(void)
+         {
+             /* The PC owns the target value; only actual pixel feedback is streamed. */
+             send_data = (Car_Mode == X_Mode) ?
+-                        (int32_t)Vision_Control_GetXPixelActual() :
+-                        (int32_t)Vision_Control_GetYPixelActual();
++                        (int32_t)gimbal_get_x_pixel_px() :
++                        (int32_t)gimbal_get_y_pixel_px();
+             last_fact_tick = now;
+             set_computer_value(SEND_FACT_CMD, CURVES_CH1, &send_data, 1);
+         }
+@@ -223,11 +223,11 @@ void Protocol_Datas_Proc(void)
+         {
+             if (Car_Mode == X_Rate_Mode)
+             {
+-                send_data = (int32_t)Vision_Control_GetXRate();
++                send_data = (int32_t)gimbal_get_x_rate_rpm();
+             }
+             else
+             {
+-                send_data = (int32_t)Vision_Control_GetYRate();
++                send_data = (int32_t)gimbal_get_y_rate_rpm();
+             }
+             last_fact_tick = now;
+             /* CH1 only: actual Euler-difference gimbal speed (rpm).  Command is on OLED. */
+@@ -256,11 +256,11 @@ void Protocol_Datas_Proc(void)
+     {
+     case Speed_Mode:
+         send_data = (int32_t)encoder_left.speed_mm_s;
+-        pwm_data = SpeedL;
++        pwm_data = left_pwm;
+         break;
+     case Speed2_Mode:
+         send_data = (int32_t)encoder_right.speed_mm_s;
+-        pwm_data = SpeedR;
++        pwm_data = right_pwm;
+         break;
+     case Location_Mode:
+         send_data = Distance;
+@@ -394,13 +394,13 @@ void PID_Debug_OLED_Show(void)
+                 (unsigned long)(maixcam_attitude_frame_count % 1000U),
+                 (unsigned long)(maixcam_attitude_raw_frame_count % 1000U));
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "Lap:%d/%d T:%2d", Control_GetLapDone(),
+-                Control_GetLapTarget(), Control_GetTurnDone());
++        sprintf(line, "Lap:%d/%d T:%2d", control_get_lap_done(),
++                control_get_lap_target(), control_get_turn_done());
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "RUN:%d Cal:%s", (car_go != 0U),
++        sprintf(line, "RUN:%d Cal:%s", (control_running != 0U),
+                 Key_GetGrayCalibrationText());
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+-        Format_Float1(value, Control_GetRunDistanceMm());
++        Format_Float1(value, control_get_run_distance_mm());
+         sprintf(line, "Enc:%7smm", value);
+         OLED_ShowString(0, 4, (uint8_t *)line, 12);
+         Format_Float1(value, Yaw);
+@@ -412,9 +412,9 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Speed_Mode:
+         OLED_ShowModeTitle("25E Speed_Mode");
+-        sprintf(line, "run:%d tar:%4ld  ", car_go, (long)pid_speed.target_val);
++        sprintf(line, "run:%d tar:%4ld  ", control_running, (long)pid_speed.target_val);
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "act:%4d pwm:%3d", Motor1_Speed, SpeedL);
++        sprintf(line, "act:%4d pwm:%3d", Motor1_Speed, left_pwm);
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+         OLED_ShowPidValue(3, "P", pid->Kp);
+         OLED_ShowPidValue(4, "I", pid->Ki);
+@@ -434,9 +434,9 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Speed2_Mode:
+         OLED_ShowModeTitle("25E Speed2_Mode");
+-        sprintf(line, "run:%d tar:%4ld  ", car_go, (long)pid_speed2.target_val);
++        sprintf(line, "run:%d tar:%4ld  ", control_running, (long)pid_speed2.target_val);
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "act:%4d pwm:%3d", Motor2_Speed, SpeedR);
++        sprintf(line, "act:%4d pwm:%3d", Motor2_Speed, right_pwm);
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+         OLED_ShowPidValue(3, "P", pid->Kp);
+         OLED_ShowPidValue(4, "I", pid->Ki);
+@@ -450,11 +450,11 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Location_Mode:
+         OLED_ShowModeTitle("25E Loc_Mode");
+-        sprintf(line, "run:%d tar:%6ld", car_go, (long)pid_location.target_val);
++        sprintf(line, "run:%d tar:%6ld", control_running, (long)pid_location.target_val);
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "d:%7ld v:%3d ", (long)Distance, Speed_Set);
++        sprintf(line, "d:%7ld v:%3d ", (long)Distance, speed_target_mm_s);
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "p1:%4d p2:%4d ", SpeedL, SpeedR);
++        sprintf(line, "p1:%4d p2:%4d ", left_pwm, right_pwm);
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+         OLED_ShowPidValue(4, "P", pid->Kp);
+         OLED_ShowPidValue(5, "I", pid->Ki);
+@@ -466,11 +466,11 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Angle_Mode:
+         OLED_ShowModeTitle("25E Angle_Mode");
+-        sprintf(line, "run:%d tar:%6ld", car_go, (long)pid_angle.target_val);
++        sprintf(line, "run:%d tar:%6ld", control_running, (long)pid_angle.target_val);
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "y:%6ld w:%3d  ", (long)Yaw, Speed_Set);
++        sprintf(line, "y:%6ld w:%3d  ", (long)Yaw, speed_target_mm_s);
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "p1:%4d p2:%4d ", SpeedL, SpeedR);
++        sprintf(line, "p1:%4d p2:%4d ", left_pwm, right_pwm);
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+         OLED_ShowPidValue(4, "P", pid->Kp);
+         OLED_ShowPidValue(5, "I", pid->Ki);
+@@ -481,8 +481,8 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Gray_Mode:
+         OLED_ShowModeTitle("25E Gray_Mode");
+-        sprintf(line, "run:%d spd:%3dcm", car_go,
+-                (int)(Control_GetLineBaseSpeed() / 10.0f));
++        sprintf(line, "run:%d spd:%3dcm", control_running,
++                (int)(control_get_line_speed_mm_s() / 10.0f));
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+         sprintf(line, "err:%6d out:%3d", result_angle,
+                 (int)pid_graysensor.output);
+@@ -490,22 +490,22 @@ void PID_Debug_OLED_Show(void)
+         OLED_ShowPidValue(3, "P", pid->Kp);
+         OLED_ShowPidValue(4, "I", pid->Ki);
+         OLED_ShowPidValue(5, "D", pid->Kd);
+-        sprintf(line, "pwm:%3d,%3d", SpeedL, SpeedR);
++        sprintf(line, "pwm:%3d,%3d", left_pwm, right_pwm);
+         OLED_ShowString(0, 6, (uint8_t *)line, 12);
+         break;
+ 
+     case X_Mode:
+         OLED_ShowModeTitle("X PIXEL PID");
+-        sprintf(line, "aim:%-5s v:%d", Vision_Control_GetStateText(),
+-                Vision_Control_IsTargetValid());
++        sprintf(line, "aim:%-5s v:%d", gimbal_get_state_text(),
++                gimbal_target_valid());
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "tar:%3d act:%3d", (int)Vision_Control_GetXPixelTarget(),
+-                (int)Vision_Control_GetXPixelActual());
++        sprintf(line, "tar:%3d act:%3d", (int)gimbal_get_x_pixel_target_px(),
++                (int)gimbal_get_x_pixel_px());
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "rpm:%3d/%3d", (int)Vision_Control_GetXRateCommand(),
+-                (int)Vision_Control_GetXRate());
++        sprintf(line, "rpm:%3d/%3d", (int)gimbal_get_x_rate_target_rpm(),
++                (int)gimbal_get_x_rate_rpm());
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+-        sprintf(line, "spd:%4drpm", (int)Vision_Control_GetXMotorSpeedCommand());
++        sprintf(line, "spd:%4drpm", (int)gimbal_get_x_cmd_rpm());
+         OLED_ShowString(0, 4, (uint8_t *)line, 12);
+         OLED_ShowPidValue(5, "P", pid->Kp);
+         OLED_ShowPidValue(6, "I", pid->Ki);
+@@ -514,16 +514,16 @@ void PID_Debug_OLED_Show(void)
+ 
+     case Y_Mode:
+         OLED_ShowModeTitle("Y PIXEL PID");
+-        sprintf(line, "aim:%-5s v:%d", Vision_Control_GetStateText(),
+-                Vision_Control_IsTargetValid());
++        sprintf(line, "aim:%-5s v:%d", gimbal_get_state_text(),
++                gimbal_target_valid());
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "tar:%3d act:%3d", (int)Vision_Control_GetYPixelTarget(),
+-                (int)Vision_Control_GetYPixelActual());
++        sprintf(line, "tar:%3d act:%3d", (int)gimbal_get_y_pixel_target_px(),
++                (int)gimbal_get_y_pixel_px());
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "rpm:%3d/%3d", (int)Vision_Control_GetYRateCommand(),
+-                (int)Vision_Control_GetYRate());
++        sprintf(line, "rpm:%3d/%3d", (int)gimbal_get_y_rate_target_rpm(),
++                (int)gimbal_get_y_rate_rpm());
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+-        sprintf(line, "spd:%4drpm", (int)Vision_Control_GetYMotorSpeedCommand());
++        sprintf(line, "spd:%4drpm", (int)gimbal_get_y_cmd_rpm());
+         OLED_ShowString(0, 4, (uint8_t *)line, 12);
+         OLED_ShowPidValue(5, "P", pid->Kp);
+         OLED_ShowPidValue(6, "I", pid->Ki);
+@@ -533,11 +533,11 @@ void PID_Debug_OLED_Show(void)
+     case X_Rate_Mode:
+         OLED_ShowModeTitle("X IMU DIFF RPM PID");
+         sprintf(line, "rpm:%4d/%4d", (int)pid_dr4310X_imu_rate.target_val,
+-                (int)Vision_Control_GetXRate());
++                (int)gimbal_get_x_rate_rpm());
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "spd:%4drpm", (int)Vision_Control_GetXMotorSpeedCommand());
++        sprintf(line, "spd:%4drpm", (int)gimbal_get_x_cmd_rpm());
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "state:%-4s", Vision_Control_GetStateText());
++        sprintf(line, "state:%-4s", gimbal_get_state_text());
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+         OLED_ShowPidValue(4, "P", pid->Kp);
+         OLED_ShowPidValue(5, "I", pid->Ki);
+@@ -550,11 +550,11 @@ void PID_Debug_OLED_Show(void)
+     case Y_Rate_Mode:
+         OLED_ShowModeTitle("Y IMU DIFF RPM PID");
+         sprintf(line, "rpm:%4d/%4d", (int)pid_dr4310Y_imu_rate.target_val,
+-                (int)Vision_Control_GetYRate());
++                (int)gimbal_get_y_rate_rpm());
+         OLED_ShowString(0, 1, (uint8_t *)line, 12);
+-        sprintf(line, "spd:%4drpm", (int)Vision_Control_GetYMotorSpeedCommand());
++        sprintf(line, "spd:%4drpm", (int)gimbal_get_y_cmd_rpm());
+         OLED_ShowString(0, 2, (uint8_t *)line, 12);
+-        sprintf(line, "state:%-4s", Vision_Control_GetStateText());
++        sprintf(line, "state:%-4s", gimbal_get_state_text());
+         OLED_ShowString(0, 3, (uint8_t *)line, 12);
+         OLED_ShowPidValue(4, "P", pid->Kp);
+         OLED_ShowPidValue(5, "I", pid->Ki);
+diff --git a/21F/21F/System/bsp_debug/protocol.c b/21F/21F/System/bsp_debug/protocol.c
+index 1400495..3dec522 100644
+--- a/21F/21F/System/bsp_debug/protocol.c
++++ b/21F/21F/System/bsp_debug/protocol.c
+@@ -53,9 +53,9 @@ static void Protocol_ClearDebugValues(void)
+        WIT-A here: STOP/page switching must reset WIT-B through MaixCam only. */
+     Encoder_ResetDistance();
+ 
+-    Speed_Set = 0;
+-    SpeedL = 0;
+-    SpeedR = 0;
++    speed_target_mm_s = 0;
++    left_pwm = 0;
++    right_pwm = 0;
+ 
+     /* STOP explicitly clears the Wildfire target field once. */
+     set_computer_value(SEND_TARGET_CMD, CURVES_CH1, &zero, 1);
+@@ -406,12 +406,12 @@ int8_t receiving_process(void)
+ 
+         if (Car_Mode == X_Mode)
+         {
+-            Vision_Control_SetPixelDebugTarget(0U, (float)actual_temp);
++            gimbal_set_pixel_target(0U, (float)actual_temp);
+             break;
+         }
+         if (Car_Mode == Y_Mode)
+         {
+-            Vision_Control_SetPixelDebugTarget(1U, (float)actual_temp);
++            gimbal_set_pixel_target(1U, (float)actual_temp);
+             break;
+         }
+ 
+@@ -421,12 +421,12 @@ int8_t receiving_process(void)
+             if (Car_Mode == X_Rate_Mode)
+             {
+                 set_pid_target(&pid_dr4310X_imu_rate, (float)actual_temp);
+-                Vision_Control_SetImuRateDebugTarget(0U, (float)actual_temp);
++                gimbal_set_rate_target(0U, (float)actual_temp);
+             }
+             else
+             {
+                 set_pid_target(&pid_dr4310Y_imu_rate, (float)actual_temp);
+-                Vision_Control_SetImuRateDebugTarget(1U, (float)actual_temp);
++                gimbal_set_rate_target(1U, (float)actual_temp);
+             }
+             break;
+         }
+@@ -435,32 +435,32 @@ int8_t receiving_process(void)
+         set_point = actual_temp;
+         if (Car_Mode != Run_Mode)
+         {
+-            PID_Debug_Stop();
++            control_debug_stop();
+         }
+ 
+         if (Car_Mode == Speed_Mode)
+         {
+-            car_go = 1U;
++            control_running = 1U;
+             set_speed_pid_target(&pid_speed, set_point);
+         }
+         else if (Car_Mode == Speed2_Mode)
+         {
+-            car_go = 1U;
++            control_running = 1U;
+             set_speed_pid_target(&pid_speed2, set_point);
+         }
+         else if (Car_Mode == Location_Mode)
+         {
+-            car_go = 1U;
++            control_running = 1U;
+             set_pid_target(&pid_location, set_point);
+         }
+         else if (Car_Mode == Angle_Mode)
+         {
+-            car_go = 1U;
++            control_running = 1U;
+             set_pid_target(&pid_angle, set_point);
+         }
+         else if (Car_Mode == Gray_Mode)
+         {
+-            car_go = 1U;
++            control_running = 1U;
+             set_pid_target(&pid_graysensor, (float)actual_temp);
+         }
+         break;
+@@ -470,29 +470,29 @@ int8_t receiving_process(void)
+         /* Clear PID state before applying a new target. */
+         if (Car_Mode != Run_Mode)
+         {
+-            PID_Debug_Stop();
++            control_debug_stop();
+         }
+         
+         if(Car_Mode == Speed_Mode)
+         {
+             /* 零目标仍保持 10ms 速度环运行，由速度 PID 主动减速。 */
+-            car_go = 1;
++            control_running = 1;
+             set_speed_pid_target(&pid_speed, set_point);
+         }
+         else if(Car_Mode == Speed2_Mode)
+         {
+             /* 零目标仍保持 10ms 速度环运行，由速度 PID 主动减速。 */
+-            car_go = 1;
++            control_running = 1;
+             set_speed_pid_target(&pid_speed2, set_point);
+         }
+         else if(Car_Mode == Location_Mode)
+         {
+-            car_go = 1;
++            control_running = 1;
+             set_pid_target(&pid_location, set_point);
+         }
+         else if(Car_Mode == Angle_Mode)
+         {
+-            car_go = 1;
++            control_running = 1;
+             set_pid_target(&pid_angle, set_point); // 角度环和位置环共用一个 PID 结构体
+         }
+         }
+@@ -510,36 +510,34 @@ int8_t receiving_process(void)
+      {
+         if (Car_Mode == X_Mode)
+         {
+-            Vision_Control_StartPixelDebug(0U);
++            gimbal_start_pixel_debug(0U);
+             break;
+         }
+         if (Car_Mode == Y_Mode)
+         {
+-            Vision_Control_StartPixelDebug(1U);
++            gimbal_start_pixel_debug(1U);
+             break;
+         }
+         if (Car_Mode == X_Rate_Mode)
+         {
+-            Vision_Control_StartImuRateDebug(0U);
++            gimbal_start_rate_debug(0U);
+             break;
+         }
+         if (Car_Mode == Y_Rate_Mode)
+         {
+-            Vision_Control_StartImuRateDebug(1U);
++            gimbal_start_rate_debug(1U);
+             break;
+         }
+         if (Car_Mode != Run_Mode)
+         {
+-            PID_Debug_Stop();
++            control_debug_stop();
+             if (Car_Mode == Location_Mode)
+             {
+                 Encoder_ResetDistance();
+             }
+-            car_go = 1;
+-            Location_flag = 0;
+-            Angle_flag = 0;
+-            Gray_flag = 0;
+-        }
++            control_running = 1;
++
++}
+      }
+      }
+      break;
+@@ -550,12 +548,10 @@ int8_t receiving_process(void)
+             selected by the Wildfire assistant. */
+          /* A non-blocking transaction first disables both motors, asks
+             MaixCAM to zero yaw, then remains stopped after bit2 protection. */
+-         Vision_Control_RequestGimbalStop();
+-         car_go = 0;
+-         Location_flag = 0;
+-         Angle_flag = 0;
+-         Gray_flag = 0;
+-         PID_Debug_Stop();
++         gimbal_request_stop();
++         control_running = 0;
++
++control_debug_stop();
+          Protocol_ClearDebugValues();
+      }
+      break; 
+@@ -568,14 +564,14 @@ int8_t receiving_process(void)
+      
+       case SET_PERIOD_CMD:  // 用作切换调参模式
+       {
+-         car_go = 0;
+-          PID_Debug_Stop();
++         control_running = 0;
++          control_debug_stop();
+           Car_Mode++;
+           Car_Mode %= PID_MODE_COUNT;
+           /* The selected page remains safely disabled until 0x13 bit2 first
+              confirms the request, its yaw-zero guard ends, and three fresh
+              samples rebuild the difference-speed history. */
+-          Vision_Control_RequestGimbalMode(Car_Mode);
++          gimbal_request_mode(Car_Mode);
+       }
+      break;
+ 
+diff --git a/21F/21F/System/headfile.h b/21F/21F/System/headfile.h
+index e4bc8ce..e2a3623 100644
+--- a/21F/21F/System/headfile.h
++++ b/21F/21F/System/headfile.h
+@@ -49,6 +49,6 @@ extern float battery_voltage;
+ #define Angle_Mode 8U
+ #define Gray_Mode 9U
+ extern uint8_t Car_Mode; // 运行模式
+-extern uint8_t car_go; // 1 代表启动了，0 代表没有启动
++extern uint8_t control_running; // 1 代表启动了，0 代表没有启动
+ 
+ #endif
+

@@ -1,0 +1,440 @@
+diff --git a/Hardware/PID/bsp_pid.c b/Hardware/PID/bsp_pid.c
+index b39a7ae..4ff6326 100644
+--- a/Hardware/PID/bsp_pid.c
++++ b/Hardware/PID/bsp_pid.c
+@@ -1,5 +1,9 @@
+ #include "bsp_pid.h"
+ 
++#define SPEED_ZERO_THRESHOLD  1.0f
++#define SPEED_INTEGRAL_LIMIT  300.0f
++#define SPEED_PWM_LIMIT_MAX   100.0f
++
+ _pid pid_speed;
+ _pid pid_speed2;
+ _pid pid_location;
+@@ -26,6 +30,7 @@ static void PID_InitInstance(_pid *pid, float kp, float ki, float kd)
+   pid->Kd = kd;
+   pid->integral = 0.0f;
+   pid->output = 0.0f;
++  pid->zero_speed_reached = 0U;
+ }
+ 
+ /**
+@@ -60,6 +65,7 @@ void PID_Reset(_pid *pid)
+   pid->err_prev = 0.0f;
+   pid->integral = 0.0f;
+   pid->output = 0.0f;
++  pid->zero_speed_reached = 0U;
+ }
+ 
+ void PID_Clear_State(_pid *pid)
+@@ -71,6 +77,7 @@ void PID_Clear_State(_pid *pid)
+   pid->err_prev = 0.0f;
+   pid->integral = 0.0f;
+   pid->output = 0.0f;
++  pid->zero_speed_reached = 0U;
+ }
+ 
+ /**
+@@ -84,6 +91,29 @@ void set_pid_target(_pid *pid, float temp_val)
+   pid->target_val = temp_val;    // 设置当前的目标值
+ }
+ 
++/**
++  * @brief  设置速度环目标，并在进入零目标或反向时清除历史状态。
++  * @param  pid 速度环 PID 实例。
++  * @param  temp_val 新目标速度，单位为每 10ms 编码器增量。
++  * @retval 无。
++  */
++void set_speed_pid_target(_pid *pid, float temp_val)
++{
++  float previous_target = pid->target_val;
++
++  if (((previous_target != 0.0f) && (temp_val == 0.0f)) ||
++      ((previous_target * temp_val) < 0.0f))
++  {
++    PID_Clear_State(pid);
++  }
++
++  pid->target_val = temp_val;
++  if (temp_val != 0.0f)
++  {
++    pid->zero_speed_reached = 0U;
++  }
++}
++
+ /**
+   * @brief  获取目标值
+   * @param  无
+@@ -135,51 +165,72 @@ float location_pid_realize(_pid *pid, float actual_val)  //位置环光个Kp好
+ }
+ 
+ /**
+-  * @brief  速度PID算法实现
+-  * @param  actual_val:实际值
+-	*	@note 	无
+-  * @retval 通过PID计算后的输出
++  * @brief  执行一次速度 PID，并在零目标时完成受限闭环减速。
++  * @param  pid 速度环 PID 实例。
++  * @param  actual_val 当前速度，单位为每 10ms 编码器增量。
++  * @param  output_limit 本周期 PWM 绝对值上限，范围为 0~100。
++  * @retval 限幅后的 PWM 输出，范围为 -output_limit~output_limit。
+   */
+-float speed_pid_realize(_pid *pid, float actual_val)
++float speed_pid_realize(_pid *pid, float actual_val, float output_limit)
+ {
++  float previous_actual = pid->actual_val;
++  float derivative;
++  float candidate_integral;
++  float candidate_output;
++
++  if (output_limit < 0.0f)
++  {
++    output_limit = -output_limit;
++  }
++  output_limit = Limit_Float(output_limit, 0.0f, SPEED_PWM_LIMIT_MAX);
+   pid->actual_val = actual_val;
+ 
+-  /*
+-   * 目标速度为 0 时，直接清零，防止停车后积分残留
+-   */
+   if (pid->target_val == 0.0f)
+   {
+-    PID_Reset(pid);
+-    return 0.0f;
++    if (pid->zero_speed_reached != 0U)
++    {
++      pid->output = 0.0f;
++      return 0.0f;
++    }
++
++    if (((actual_val >= -SPEED_ZERO_THRESHOLD) &&
++         (actual_val <= SPEED_ZERO_THRESHOLD)) ||
++        ((previous_actual > 0.0f) && (actual_val < 0.0f)) ||
++        ((previous_actual < 0.0f) && (actual_val > 0.0f)))
++    {
++      PID_Clear_State(pid);
++      pid->zero_speed_reached = 1U;
++      return 0.0f;
++    }
+   }
+ 
+   pid->err = pid->target_val - pid->actual_val;
+-
+-  /*
+-   * 小死区，防止速度误差很小时反复抖动
+-   * diff_cnt 作为速度输入时，这里用 1 比较合适
+-   */
+-  if (pid->err > -1.0f && pid->err < 1.0f)
++  if ((pid->err > -1.0f) && (pid->err < 1.0f))
+   {
+     pid->err = 0.0f;
+   }
+ 
+-  pid->integral += pid->err;
+-
+-  /*
+-   * 积分限幅
+-   */
+-  pid->integral = Limit_Float(pid->integral, -300.0f, 300.0f);
+-
+-  pid->output = pid->Kp * pid->err + pid->Ki * pid->integral + pid->Kd * (pid->err - pid->err_last);
++  derivative = pid->err - pid->err_last;
++  candidate_integral = Limit_Float(pid->integral + pid->err,
++                                   -SPEED_INTEGRAL_LIMIT,
++                                   SPEED_INTEGRAL_LIMIT);
++  candidate_output = pid->Kp * pid->err +
++                     pid->Ki * candidate_integral +
++                     pid->Kd * derivative;
++
++  /* 输出饱和且误差仍推动同方向饱和时，暂停积分累加。 */
++  if (!(((candidate_output > output_limit) && (pid->err > 0.0f)) ||
++        ((candidate_output < -output_limit) && (pid->err < 0.0f))))
++  {
++    pid->integral = candidate_integral;
++  }
+ 
++  pid->output = pid->Kp * pid->err +
++                pid->Ki * pid->integral +
++                pid->Kd * derivative;
++  pid->output = Limit_Float(pid->output, -output_limit, output_limit);
+   pid->err_last = pid->err;
+ 
+-  /*
+-   * PWM 输出限幅，和 Motor_SetSpeed 的 -100~100 保持一致
+-   */
+-  pid->output = Limit_Float(pid->output, -100.0f, 100.0f);
+-
+   return pid->output;
+ }
+ 
+diff --git a/Hardware/PID/bsp_pid.h b/Hardware/PID/bsp_pid.h
+index 2e18c8b..6b69d74 100644
+--- a/Hardware/PID/bsp_pid.h
++++ b/Hardware/PID/bsp_pid.h
+@@ -15,7 +15,7 @@ typedef struct
+     float integral; // 积分值，位置式PID使用
+     float output;   // PID输出值
+ 
+-
++    unsigned char zero_speed_reached; // 零目标减速完成锁存，仅供速度环使用
+ 
+ } _pid;
+ 
+@@ -30,12 +30,13 @@ void PID_Reset(_pid *pid);
+ void PID_Clear_State(_pid *pid);
+ 
+ void set_pid_target(_pid *pid, float temp_val);
++void set_speed_pid_target(_pid *pid, float temp_val);
+ float get_pid_target(_pid *pid);
+ void set_p_i_d(_pid *pid, float p, float i, float d);
+ 
+ 
+ float location_pid_realize(_pid *pid, float actual_val);
+-float speed_pid_realize(_pid *pid, float actual_val);
++float speed_pid_realize(_pid *pid, float actual_val, float output_limit);
+ float angle_pid_realize(_pid *pid, float actual_val);
+ float gray_pid_realize(_pid *pid, float actual_val);
+ float Angle_Error(float target, float actual);
+diff --git a/Hardware/control.c b/Hardware/control.c
+index d96064b..04f82f5 100644
+--- a/Hardware/control.c
++++ b/Hardware/control.c
+@@ -6,6 +6,7 @@
+ #define SPEED_TARGET_LIMIT    80.0f
+ #define LINE_TURN_LIMIT       50.0f
+ #define PWM_OUTPUT_LIMIT      100.0f
++#define ZERO_SPEED_BRAKE_PWM_LIMIT  30.0f
+ 
+ int SpeedL = 0;
+ int SpeedR = 0;
+@@ -27,6 +28,8 @@ static void Cascade_Speed_Output(float left_target_speed, float right_target_spe
+ {
+     float left_pwm;
+     float right_pwm;
++    float left_output_limit;
++    float right_output_limit;
+ 
+     left_target_speed = Limit_Float(left_target_speed,
+                                     -SPEED_TARGET_LIMIT,
+@@ -35,14 +38,23 @@ static void Cascade_Speed_Output(float left_target_speed, float right_target_spe
+                                      -SPEED_TARGET_LIMIT,
+                                      SPEED_TARGET_LIMIT);
+ 
+-    set_pid_target(&pid_speed, left_target_speed);
+-    set_pid_target(&pid_speed2, right_target_speed);
++    set_speed_pid_target(&pid_speed, left_target_speed);
++    set_speed_pid_target(&pid_speed2, right_target_speed);
+ 
+-    left_pwm = speed_pid_realize(&pid_speed, (float)encoder_left.diff_cnt);
+-    right_pwm = speed_pid_realize(&pid_speed2, (float)encoder_right.diff_cnt);
++    left_output_limit = (left_target_speed == 0.0f) ?
++                        ZERO_SPEED_BRAKE_PWM_LIMIT : PWM_OUTPUT_LIMIT;
++    right_output_limit = (right_target_speed == 0.0f) ?
++                         ZERO_SPEED_BRAKE_PWM_LIMIT : PWM_OUTPUT_LIMIT;
+ 
+-    left_pwm = Limit_Float(left_pwm, -PWM_OUTPUT_LIMIT, PWM_OUTPUT_LIMIT);
+-    right_pwm = Limit_Float(right_pwm, -PWM_OUTPUT_LIMIT, PWM_OUTPUT_LIMIT);
++    left_pwm = speed_pid_realize(&pid_speed,
++                                 (float)encoder_left.diff_cnt,
++                                 left_output_limit);
++    right_pwm = speed_pid_realize(&pid_speed2,
++                                  (float)encoder_right.diff_cnt,
++                                  right_output_limit);
++
++    left_pwm = Limit_Float(left_pwm, -left_output_limit, left_output_limit);
++    right_pwm = Limit_Float(right_pwm, -right_output_limit, right_output_limit);
+ 
+     SpeedL = (int)left_pwm;
+     SpeedR = (int)right_pwm;
+diff --git a/Hardware/motor/bsp_motor.c b/Hardware/motor/bsp_motor.c
+index 42f23d6..d186ac5 100644
+--- a/Hardware/motor/bsp_motor.c
++++ b/Hardware/motor/bsp_motor.c
+@@ -12,85 +12,73 @@ static int16_t Motor_Limit(int16_t speed)
+     return speed;
+ }
+ 
+-void Motor_Init(void)
+-{
+-    HAL_TIM_PWM_Start(&htim3,TIM_CHANNEL_1);	//PWMA 
+-    HAL_TIM_PWM_Start(&htim3,TIM_CHANNEL_2);	//PWMB
+-
+-}
+-
+-void Motor_SetSpeed(Motor_Id_t motor, int16_t speed)
+-{
+-    speed = Motor_Limit(speed);
+-
+-    if(motor == MOTOR_LEFT)
+-    {
+-        if(speed > 0)
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, speed);
+-        }
+-        else if(speed < 0)
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, -speed);
+-        }
+-        else
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+-        }
+-    }
+-    else if(motor == MOTOR_RIGHT)
+-    {
+-        if (speed > 0)
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, speed);
+-        }
+-        else if (speed < 0)
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_RESET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, -speed);
+-        }
+-        else
+-        {
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
+-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_RESET);
+-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+-        }
+-    }
+-}
+-
++void Motor_Init(void)
++{
++    HAL_TIM_PWM_Start(&htim3,TIM_CHANNEL_1);	//PWMA
++    HAL_TIM_PWM_Start(&htim3,TIM_CHANNEL_2);	//PWMB
++    Motor_Stop();
++}
+ 
+-void Motor_Brake(Motor_Id_t motor)
++/**
++  * @brief  设置单个电机的方向和 PWM。
++  * @param  motor 左轮或右轮电机。
++  * @param  speed PWM 指令，范围为 -100~100；0 表示高阻停止。
++  * @retval 无。
++  */
++void Motor_SetSpeed(Motor_Id_t motor, int16_t speed)
+ {
++    speed = Motor_Limit(speed);
++
+     if(motor == MOTOR_LEFT)
+     {
+-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
+-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
+-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, PWM_MAX);
++        /* 先同时拉低方向脚，换向过程不会经过 IN1=IN2=1。 */
++        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_RESET);
++
++        if(speed > 0)
++        {
++            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, speed);
++        }
++        else if(speed < 0)
++        {
++            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, -speed);
++        }
++        else
++        {
++            /* TB6612 Stop：IN1=IN2=0、PWM=1，输出为高阻态。 */
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, PWM_MAX);
++        }
+     }
+     else if(motor == MOTOR_RIGHT)
+     {
+-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
+-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
+-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, PWM_MAX);
++        /* 先同时拉低方向脚，换向过程不会经过 IN1=IN2=1。 */
++        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_RESET);
++
++        if (speed > 0)
++        {
++            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, speed);
++        }
++        else if (speed < 0)
++        {
++            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, -speed);
++        }
++        else
++        {
++            /* TB6612 Stop：IN1=IN2=0、PWM=1，输出为高阻态。 */
++            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, PWM_MAX);
++        }
+     }
+ }
+ 
+-void Motor_BrakeAll(void)
++/**
++  * @brief  使左右电机进入 TB6612 高阻停止状态。
++  * @retval 无。
++  */
++void Motor_Stop(void)
+ {
+-    Motor_Brake(MOTOR_LEFT);
+-    Motor_Brake(MOTOR_RIGHT);
++    Motor_SetSpeed(MOTOR_LEFT, 0);
++    Motor_SetSpeed(MOTOR_RIGHT, 0);
+ }
+-void Motor_Stop(void)
+-{
+-    Motor_SetSpeed(MOTOR_LEFT, 0);
+-    Motor_SetSpeed(MOTOR_RIGHT, 0);
+-}
+diff --git a/Hardware/motor/bsp_motor.h b/Hardware/motor/bsp_motor.h
+index 238f610..0ef25d2 100644
+--- a/Hardware/motor/bsp_motor.h
++++ b/Hardware/motor/bsp_motor.h
+@@ -9,11 +9,9 @@ typedef enum
+     MOTOR_RIGHT
+ } Motor_Id_t;
+ 
+-void Motor_Init(void);
+-void Motor_SetSpeed(Motor_Id_t motor, int16_t speed);
+-void Motor_Brake(Motor_Id_t motor);
+-void Motor_BrakeAll(void);
+-void Motor_Stop(void);
++void Motor_Init(void);
++void Motor_SetSpeed(Motor_Id_t motor, int16_t speed);
++void Motor_Stop(void);
+ 
+ 
+ 
+diff --git a/System/bsp_debug/protocol.c b/System/bsp_debug/protocol.c
+index 75519d5..bae5ffc 100644
+--- a/System/bsp_debug/protocol.c
++++ b/System/bsp_debug/protocol.c
+@@ -415,13 +415,15 @@ int8_t receiving_process(void)
+         
+         if(Car_Mode == Speed_Mode)
+         {
+-            car_go = (set_point != 0.0f) ? 1 : 0;
+-            set_pid_target(&pid_speed, set_point);
++            /* 零目标仍保持 10ms 速度环运行，由速度 PID 主动减速。 */
++            car_go = 1;
++            set_speed_pid_target(&pid_speed, set_point);
+         }
+         else if(Car_Mode == Speed2_Mode)
+         {
+-            car_go = (set_point != 0.0f) ? 1 : 0;
+-            set_pid_target(&pid_speed2, set_point);
++            /* 零目标仍保持 10ms 速度环运行，由速度 PID 主动减速。 */
++            car_go = 1;
++            set_speed_pid_target(&pid_speed2, set_point);
+         }
+         else if(Car_Mode == Location_Mode)
+         {

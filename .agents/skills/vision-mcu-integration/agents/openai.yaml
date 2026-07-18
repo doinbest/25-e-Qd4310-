@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vision MCU Integration"
+  short_description: "Safely integrate MaixCAM2 vision feedback with MCU control."
+  default_prompt: "Use $vision-mcu-integration to review the vision-to-MCU protocol."

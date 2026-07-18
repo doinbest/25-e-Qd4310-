@@ -1,0 +1,4 @@
+interface:
+  display_name: "Embedded Control Review"
+  short_description: "Review safe bare-metal motor-control changes."
+  default_prompt: "Use $embedded-control-review to review this embedded control change."

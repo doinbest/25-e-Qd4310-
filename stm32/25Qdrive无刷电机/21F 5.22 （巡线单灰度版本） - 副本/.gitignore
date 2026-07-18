@@ -1,0 +1,38 @@
+# Video captures / test recordings
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+*.mkv
+*.MKV
+
+# Keil / ARM build outputs
+**/MDK-ARM/build/
+**/MDK-ARM/21F/
+**/MDK-ARM/*.uvguix.*
+**/MDK-ARM/JLinkLog.txt
+**/MDK-ARM/*.scvd
+**/MDK-ARM/*.uvoptx.bak
+**/.pack/
+**/.cmsis/
+**/RTE/Device/
+**/.vscode/*.log
+**/.vscode/*.log.lock
+
+# Generated compiler/linker artifacts
+*.o
+*.d
+*.crf
+*.lst
+*.lnp
+*.axf
+*.hex
+*.map
+*.s19
+*.htm
+*.build_log.htm
+*.dep
+*.bak
+*.tmp
