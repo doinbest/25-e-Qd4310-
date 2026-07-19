@@ -3,8 +3,9 @@
 #include <math.h>
 #include <string.h>
 
-/* 当前联调阶段仅使用 MaixCAM2 -> STM32 观测链路，禁止 USART3 反向控制帧。 */
-#define MAIXCAM_CONTROL_TX_ENABLE 0U
+// 反向控制帧仅用于相机模式/激光状态同步，100 ms 足够用于本轮稳定性验证。
+#define MAIXCAM_CONTROL_PERIOD_MS 100U
+#define MAIXCAM_CONTROL_TX_ENABLE 1U
 
 typedef enum
 {
@@ -23,6 +24,7 @@ static uint8_t maixcam_frame_index = 0U;
 static uint8_t maixcam_expected_size = 0U;
 #if MAIXCAM_CONTROL_TX_ENABLE
 static uint8_t maixcam_control_seq = 0U;
+static uint32_t maixcam_last_control_tick = 0U;
 #endif
 
 uint8_t maix_rx_byte = 0U;
@@ -278,6 +280,7 @@ void maixcam_Init(UART_HandleTypeDef *huart)
     maixcam_laser_enabled = 0U;
 #if MAIXCAM_CONTROL_TX_ENABLE
     maixcam_control_seq = 0U;
+    maixcam_last_control_tick = 0U;
 #endif
 
     if (maixcam_huart != NULL)
@@ -328,6 +331,9 @@ void maixcam_SendControlFrame(uint8_t mode, uint16_t circle_progress,
 void MaixCam_SetLaserEnabled(uint8_t enabled)
 {
     maixcam_SendControlFrame(MAIXCAM_MODE_IDLE, 0U, enabled);
+#if MAIXCAM_CONTROL_TX_ENABLE
+    maixcam_last_control_tick = HAL_GetTick();
+#endif
 }
 
 uint8_t MaixCam_GetLaserEnabled(void)
@@ -348,6 +354,9 @@ void MaixCam_LaserOff(void)
 void maixcam_Update(void)
 {
     uint8_t data;
+#if MAIXCAM_CONTROL_TX_ENABLE
+    uint32_t now;
+#endif
 
     while (maixcam_rx_read != maixcam_rx_write)
     {
@@ -355,4 +364,13 @@ void maixcam_Update(void)
         maixcam_rx_read++;
         maixcam_parse_byte(data);
     }
+
+#if MAIXCAM_CONTROL_TX_ENABLE
+    now = HAL_GetTick();
+    if ((now - maixcam_last_control_tick) >= MAIXCAM_CONTROL_PERIOD_MS)
+    {
+        maixcam_SendControlFrame(MAIXCAM_MODE_IDLE, 0U, maixcam_laser_enabled);
+        maixcam_last_control_tick = now;
+    }
+#endif
 }
